@@ -29,6 +29,10 @@ tokio = { version = "1", features = ["test-util"] }
 tracing-log = "0.2"
 wiremock = "0.6"
 
+[[test]]
+name = "writer_stdout_pipe"
+harness = false
+
 [build-dependencies]
 ergo-sbe = "=0.1.16"
 indexmap = { version = "2", features = ["serde"] }

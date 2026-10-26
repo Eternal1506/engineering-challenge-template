@@ -83,8 +83,20 @@ pub struct ProbeArgs {
 /// Options for `verify`.
 #[derive(Debug, PartialEq, Eq, Args)]
 pub struct VerifyArgs {
-    /// The SBE recording to check.
-    pub path: PathBuf,
+    /// The SBE recordings to check, in order. Files from consecutive runs are
+    /// checked as one recording.
+    #[arg(value_name = "PATH", required = true)]
+    pub paths: Vec<PathBuf>,
+
+    /// The longest allowed time between two snapshots of one symbol, in
+    /// seconds.
+    #[arg(long, value_name = "SECS", default_value = "65", value_parser = parse_seconds)]
+    pub max_snapshot_gap: Duration,
+
+    /// The highest valid price, in fixed point (1000000 is one whole unit).
+    #[arg(long, value_name = "N", default_value = "1000000",
+          value_parser = clap::value_parser!(i64).range(0..))]
+    pub max_price: i64,
 }
 
 /// Where to find the Kalshi API credentials.
@@ -212,13 +224,39 @@ mod tests {
     }
 
     #[test]
-    fn verify_takes_a_path() {
+    fn verify_takes_a_path_with_default_limits() {
         let expected = VerifyArgs {
-            path: PathBuf::from("run.sbe"),
+            paths: vec![PathBuf::from("run.sbe")],
+            max_snapshot_gap: Duration::from_secs(65),
+            max_price: 1_000_000,
         };
         assert_eq!(
             parse(&["verify", "run.sbe"]).unwrap(),
             Command::Verify(expected)
         );
+    }
+
+    #[test]
+    fn verify_takes_paths_in_order_and_limits() {
+        let expected = VerifyArgs {
+            paths: vec![PathBuf::from("b.sbe"), PathBuf::from("a.sbe")],
+            max_snapshot_gap: Duration::from_secs(90),
+            max_price: 100,
+        };
+        let args = [
+            "verify",
+            "b.sbe",
+            "a.sbe",
+            "--max-snapshot-gap",
+            "90",
+            "--max-price",
+            "100",
+        ];
+        assert_eq!(parse(&args).unwrap(), Command::Verify(expected));
+    }
+
+    #[test]
+    fn verify_rejects_a_negative_max_price() {
+        assert!(parse(&["verify", "run.sbe", "--max-price=-1"]).is_err());
     }
 }
