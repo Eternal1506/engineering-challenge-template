@@ -575,6 +575,20 @@ mod tests {
         assert_eq!(counts, expected);
     }
 
+    /// A book's snapshots are a cycle apart in stream time, but each one is
+    /// stamped up to [`STAMP_MARGIN`] behind the clock, and the tick that
+    /// takes it may come up to one tick late. The verifier's end-of-file
+    /// check measures from the last snapshot to the newest message, which
+    /// the margin also widens. So the whole sum must fit in its default gap.
+    #[test]
+    fn the_default_cycle_and_margin_fit_within_the_verifier_gap() {
+        use crate::core::verify::DEFAULT_MAX_SNAPSHOT_GAP;
+        let cycle = DEFAULT_SNAPSHOT_TICK * DEFAULT_SNAPSHOT_SLOTS as u32;
+        let margin = STAMP_MARGIN.to_std().unwrap_or(Duration::MAX);
+        let widest_gap = cycle.saturating_add(margin) + DEFAULT_SNAPSHOT_TICK;
+        assert!(widest_gap <= DEFAULT_MAX_SNAPSHOT_GAP, "{widest_gap:?}");
+    }
+
     #[test]
     fn zero_slots_are_rejected() {
         let (requests, _) = mpsc::channel(1);
