@@ -35,6 +35,13 @@ recorder will. Partway through the run it sends the following commands:
   - 20,000 tickers: 2.85 s and 3.24 s.
 - **Unopened market:** subscribing one is accepted without an error. It gets an `orderbook_snapshot` with no
   `yes_dollars_fp` and no `no_dollars_fp`, and no deltas after that.
+- **Nonexistent ticker:** accepted silently, with no error. Measured with `live_bogus_ticker_probe`
+  (`tests/kalshi_live.rs`):
+  - one `subscribe` for 10 open tickers plus `KXBOGUS-NOPE` got a normal `subscribed`;
+  - a later `add_markets` of `KXBOGUS-NOPE2` got a normal `ok`, whose ticker list (12) includes both bogus tickers;
+  - each bogus ticker got an `orderbook_snapshot`, like a real one.
+
+  So the websocket cannot reveal a mistyped or unknown ticker; only the REST catalog can.
 - **Unknown sid:** `update_subscription` naming an unknown sid gets
   `{"type":"error","id":4,"msg":{"code":7,"msg":"Unknown subscription ID"}}`. The error has no sid and no seq.
 - **Kalshi drops markets from the subscription without notice.** The `ok` replies listed 4–5 fewer of the original
