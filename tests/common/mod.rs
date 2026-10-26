@@ -8,6 +8,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use engineering_challenge::Side;
 use engineering_challenge::core::events::{FeedBody, FeedEvent, LevelChange, QuantityChange};
+use engineering_challenge::core::verify::{VerifyLimits, VerifyReport, verify_files};
 use engineering_challenge::core::writer::{
     CHUNK_SIZE, WriterConfig, WriterMessage, WriterStats, spawn_writer,
 };
@@ -29,6 +30,14 @@ pub type Levels = Vec<Level>;
 pub enum Recorded {
     Snapshot(SnapshotDomain),
     Update(PriceLevelUpdateDomain),
+}
+
+/// A message's receive time.
+pub fn received_at(message: &Recorded) -> DateTime<Utc> {
+    match message {
+        Recorded::Snapshot(snapshot) => snapshot.received_at,
+        Recorded::Update(update) => update.backtest_timestamp,
+    }
 }
 
 /// A fixed instant plus `millis` milliseconds.
@@ -80,6 +89,14 @@ fn feed_event(symbol: &str, body: FeedBody) -> FeedEvent {
         seq_hint: None,
         body,
     }
+}
+
+pub fn forget(symbol: &str) -> WriterMessage {
+    WriterMessage::Forget(Arc::from(symbol))
+}
+
+pub fn track(symbol: &str) -> WriterMessage {
+    WriterMessage::Track(Arc::from(symbol))
 }
 
 /// `event` received at `at(received)`, with exchange time `at(exchange)`
@@ -168,27 +185,46 @@ pub struct WriterRun {
     pub resnapshot_requests: Vec<Arc<str>>,
 }
 
-/// Runs the writer on `messages` with output to `output`, shuts it down, and
-/// returns its stats and the resnapshot requests it sent. The snapshot tick
-/// is an hour, so no periodic snapshot is written unless `configure` changes
-/// it.
-pub fn write_all(
+/// Runs the writer with output to `output` while `send` feeds it, then shuts
+/// it down and returns its stats and the resnapshot requests it sent. The
+/// snapshot tick is an hour, so no periodic snapshot is written unless
+/// `configure` changes it.
+pub fn run_live(
     output: &Path,
-    messages: Vec<WriterMessage>,
     configure: impl FnOnce(&mut WriterConfig),
+    send: impl FnOnce(&mpsc::Sender<WriterMessage>) -> anyhow::Result<()>,
 ) -> anyhow::Result<(WriterStats, Vec<Arc<str>>)> {
     let (requests, mut request_receiver) = mpsc::channel(16);
     let mut config = WriterConfig::new(output, requests);
     config.snapshot_tick = std::time::Duration::from_secs(3600);
     configure(&mut config);
     let (sender, handle) = spawn_writer(config)?;
-    for message in messages {
-        sender.blocking_send(message)?;
-    }
+    send(&sender)?;
     drop(sender);
     let stats = handle.join()?;
     let requests = std::iter::from_fn(|| request_receiver.try_recv().ok()).collect();
     Ok((stats, requests))
+}
+
+/// [`run_live`], sending `messages` as fast as the writer takes them.
+pub fn write_all(
+    output: &Path,
+    messages: Vec<WriterMessage>,
+    configure: impl FnOnce(&mut WriterConfig),
+) -> anyhow::Result<(WriterStats, Vec<Arc<str>>)> {
+    run_live(output, configure, |sender| {
+        messages
+            .into_iter()
+            .try_for_each(|message| Ok(sender.blocking_send(message)?))
+    })
+}
+
+/// Verifies the recording at `path` with the default limits, failing with
+/// the report unless it is clean.
+pub fn verify_clean(path: &Path) -> anyhow::Result<VerifyReport> {
+    let report = verify_files(&[path.to_owned()], &VerifyLimits::default())?;
+    anyhow::ensure!(report.is_clean(), "{report}");
+    Ok(report)
 }
 
 /// [`write_all`], then reads the output back.

@@ -30,7 +30,8 @@ const EXAMPLES_PER_KIND: usize = 5;
 pub struct VerifyLimits {
     /// The longest allowed time between two snapshots of one symbol.
     pub max_snapshot_gap: Duration,
-    /// The highest valid price, in fixed point. The lowest is 0.
+    /// The highest valid price, in fixed point. Prices must be above 0: a
+    /// price of 0 is the signature of a side-mapping bug.
     pub max_price: i64,
 }
 
@@ -109,6 +110,13 @@ pub struct VerifyReport {
     pub last_timestamp: Option<DateTime<Utc>>,
     /// Violations by kind. Kinds that never occurred are absent.
     pub violations: BTreeMap<ViolationKind, ViolationTally>,
+    /// How many symbols' receive times went backwards at least once. One
+    /// message stamped too late makes every later message of its symbol
+    /// count as going backwards, so this and the largest step back show how
+    /// widespread the problem really is.
+    pub symbols_going_backwards: usize,
+    /// The largest step back in any symbol's receive time.
+    pub largest_step_back: TimeDelta,
 }
 
 impl VerifyReport {
@@ -149,6 +157,20 @@ impl VerifyReport {
             _ => writeln!(f, "time span: no messages"),
         }
     }
+
+    fn write_examples(&self, f: &mut fmt::Formatter<'_>, kind: ViolationKind) -> fmt::Result {
+        let tally = &self.violations[&kind];
+        write!(f, "\n  {kind}: {}", tally.count)?;
+        if kind == ViolationKind::TimeWentBackwards {
+            let symbols = self.symbols_going_backwards;
+            let step = seconds(self.largest_step_back);
+            write!(f, " ({symbols} symbols, largest step back {step:.3} s)")?;
+        }
+        for example in &tally.examples {
+            write!(f, "\n    {example}")?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for VerifyReport {
@@ -163,18 +185,13 @@ impl fmt::Display for VerifyReport {
             return write!(f, "violations: none");
         }
         write!(f, "violations: {}", self.violation_count())?;
-        for (kind, tally) in &self.violations {
-            write!(f, "\n  {kind}: {}", tally.count)?;
-            for example in &tally.examples {
-                write!(f, "\n    {example}")?;
-            }
-        }
-        Ok(())
+        self.violations
+            .keys()
+            .try_for_each(|&kind| self.write_examples(f, kind))
     }
 }
 
-/// Reads the recordings at `paths` in order, as one recording, and checks
-/// its invariants:
+/// Reads the recordings at `paths` in order and checks their invariants:
 ///
 /// 1. within each file, every symbol has a snapshot before its first update;
 /// 2. a symbol's snapshots are at most `max_snapshot_gap` apart. Within each
@@ -183,12 +200,22 @@ impl fmt::Display for VerifyReport {
 ///    the market may have closed;
 /// 3. each symbol's receive times never go backwards, across files too;
 /// 4. quantities are never negative;
-/// 5. prices are within `0..=max_price`;
+/// 5. prices are within `1..=max_price`;
 /// 6. snapshot bids are strictly descending, asks strictly ascending, and no
 ///    snapshot level has zero quantity.
 ///
+/// Each path is one recorder run: invariants 1 and 2 start afresh in each
+/// file, so the downtime between consecutive runs is not a gap. Runs
+/// concatenated into one file are checked as one stream, so downtime longer
+/// than `max_snapshot_gap` between them is reported as a [`SnapshotGap`]:
+/// the recording really has no data then. Pass a crashed and a restarted
+/// run as separate paths to check each run on its own.
+///
 /// It also reports a file whose length is not a whole number of chunks.
-/// Fails only if a file cannot be read or decoded.
+/// Fails if a file cannot be read or decoded, or if the files hold no
+/// messages at all.
+///
+/// [`SnapshotGap`]: ViolationKind::SnapshotGap
 pub fn verify_files(paths: &[PathBuf], limits: &VerifyLimits) -> anyhow::Result<VerifyReport> {
     let mut checker = Checker::new(limits);
     for path in paths {
@@ -196,7 +223,12 @@ pub fn verify_files(paths: &[PathBuf], limits: &VerifyLimits) -> anyhow::Result<
             .check_file(path)
             .with_context(|| format!("reading {}", path.display()))?;
     }
-    Ok(checker.into_report())
+    let report = checker.into_report();
+    anyhow::ensure!(
+        report.snapshots + report.updates > 0,
+        "the recordings hold no messages"
+    );
+    Ok(report)
 }
 
 /// The running state of a verification.
@@ -218,6 +250,7 @@ struct Bounds {
 #[derive(Debug, Default)]
 struct SymbolState {
     last_time: Option<DateTime<Utc>>,
+    went_backwards: bool,
     last_snapshot: Option<DateTime<Utc>>,
     updated_since_snapshot: bool,
 }
@@ -326,10 +359,8 @@ impl Checker {
                     format!("{symbol} at {file_end}: {gap:.3} s from its last snapshot to the end of the file")
                 });
             }
-            *state = SymbolState {
-                last_time: state.last_time,
-                ..SymbolState::default()
-            };
+            state.last_snapshot = None;
+            state.updated_since_snapshot = false;
         }
     }
 
@@ -361,16 +392,24 @@ impl Findings<'_> {
             .record(kind, || format!("{symbol} at {at}: {}", detail()));
     }
 
+    /// Checks the message is not earlier than the symbol's latest one so
+    /// far, and tracks how many symbols go backwards and by how much.
     fn check_time(&mut self, state: &mut SymbolState) {
         let previous = state.last_time;
         state.last_time = previous.max(Some(self.at));
-        if let Some(previous) = previous
-            && self.at < previous
-        {
-            self.record(ViolationKind::TimeWentBackwards, || {
-                format!("earlier than the symbol's previous message at {previous}")
-            });
+        let Some(previous) = previous.filter(|&previous| self.at < previous) else {
+            return;
+        };
+        let step = previous - self.at;
+        self.report.largest_step_back = self.report.largest_step_back.max(step);
+        if !state.went_backwards {
+            state.went_backwards = true;
+            self.report.symbols_going_backwards += 1;
         }
+        let step = seconds(step);
+        self.record(ViolationKind::TimeWentBackwards, || {
+            format!("{step:.3} s before the symbol's latest message, at {previous}")
+        });
     }
 
     fn check_gap(&mut self, state: &SymbolState) {
@@ -413,9 +452,9 @@ impl Findings<'_> {
             });
         }
         let max_price = self.bounds.max_price;
-        if !(0..=max_price).contains(&price) {
+        if !(1..=max_price).contains(&price) {
             self.record(ViolationKind::PriceOutOfRange, || {
-                format!("{side} price {price} is outside 0..={max_price}")
+                format!("{side} price {price} is outside 1..={max_price}")
             });
         }
     }
