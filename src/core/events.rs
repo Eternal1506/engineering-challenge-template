@@ -156,6 +156,20 @@ pub enum LifecycleEvent {
     },
 }
 
+impl LifecycleEvent {
+    /// The market the event is about.
+    pub fn symbol(&self) -> &Arc<str> {
+        match self {
+            Self::Created { symbol, .. }
+            | Self::Activated { symbol }
+            | Self::Deactivated { symbol }
+            | Self::CloseChanged { symbol, .. }
+            | Self::Determined { symbol }
+            | Self::Settled { symbol } => symbol,
+        }
+    }
+}
+
 /// One decoded message from an exchange connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {

@@ -58,6 +58,11 @@ pub struct RecordArgs {
     #[arg(long, value_name = "SECS", value_parser = parse_seconds)]
     pub flush_interval: Option<Duration>,
 
+    /// How often to reconcile the recorded markets with the exchange's
+    /// catalog, in seconds.
+    #[arg(long, value_name = "SECS", default_value = "600", value_parser = parse_seconds)]
+    pub reconcile_interval: Duration,
+
     #[command(flatten)]
     pub secrets: SecretsArgs,
 }
@@ -134,6 +139,7 @@ mod tests {
             shard_size: NonZeroUsize::new(2000).unwrap(),
             replicas: NonZeroUsize::new(1).unwrap(),
             flush_interval: None,
+            reconcile_interval: Duration::from_secs(600),
             secrets: SecretsArgs {
                 dir: PathBuf::from("secrets"),
             },
@@ -177,6 +183,16 @@ mod tests {
     #[test]
     fn record_rejects_zero_flush_interval() {
         assert!(parse(&["record", "--flush-interval", "0"]).is_err());
+    }
+
+    #[test]
+    fn record_takes_a_reconcile_interval() {
+        let expected = RecordArgs {
+            reconcile_interval: Duration::from_secs(300),
+            ..default_record_args()
+        };
+        let parsed = parse(&["record", "--reconcile-interval", "300"]).unwrap();
+        assert_eq!(parsed, Command::Record(expected));
     }
 
     fn default_probe_args() -> ProbeArgs {

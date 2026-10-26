@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::Parser;
 use engineering_challenge::cli::{Cli, Command, RecordArgs, SecretsArgs, VerifyArgs};
 use engineering_challenge::core::coordinator::{
-    Coordinator, CoordinatorConfig, DEFAULT_STALL_TIMEOUT, Feed, WriterLink,
+    Coordinator, CoordinatorConfig, DEFAULT_STALL_TIMEOUT, Feed, LifecycleTimings, WriterLink,
 };
 use engineering_challenge::core::verify::{VerifyLimits, verify_files};
 use engineering_challenge::core::writer::{
@@ -92,15 +92,31 @@ fn build_recorder(
     );
     let credentials = load_credentials(&args.secrets)?;
     let feed = Feed {
-        endpoint: KalshiEndpoint::production(RequestSigner::new(&credentials)?),
+        endpoint: kalshi_endpoint(&credentials)?,
+        lifecycle_endpoint: Some(kalshi_endpoint(&credentials)?),
         codec: KalshiCodec,
     };
     let (link, writer) = start_writer(args)?;
-    let config = CoordinatorConfig {
+    let coordinator = Coordinator::new(feed, link, coordinator_config(args));
+    Ok((coordinator, writer))
+}
+
+/// The production Kalshi websocket, signing handshakes with `credentials`.
+fn kalshi_endpoint(credentials: &KalshiCredentials) -> anyhow::Result<KalshiEndpoint> {
+    Ok(KalshiEndpoint::production(RequestSigner::new(credentials)?))
+}
+
+/// The coordinator's config for `args`.
+fn coordinator_config(args: &RecordArgs) -> CoordinatorConfig {
+    let defaults = CoordinatorConfig::default();
+    CoordinatorConfig {
         shard_size: args.shard_size.get(),
-        ..CoordinatorConfig::default()
-    };
-    Ok((Coordinator::new(feed, link, config), writer))
+        lifecycle: LifecycleTimings {
+            reconcile_interval: args.reconcile_interval,
+            ..defaults.lifecycle.clone()
+        },
+        ..defaults
+    }
 }
 
 /// Starts the writer thread on `args.output`, returning the coordinator's

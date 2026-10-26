@@ -9,9 +9,10 @@
 //! symbol, so each symbol's times never go backwards, even when events from
 //! different connections arrive slightly out of order.
 
+mod forgotten;
 mod progress;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -27,6 +28,8 @@ use crate::core::events::{FeedBody, FeedEvent, LevelChange};
 use crate::util::AlignedSbeWriter;
 use crate::util::dtos::challenge_orderbook::{PriceLevelUpdateDomain, SnapshotDomain};
 
+pub use forgotten::FORGOTTEN_RETENTION;
+pub(crate) use forgotten::Forgotten;
 pub use progress::WriterProgress;
 
 /// The output chunk size. `AlignedSbeReader` reads 64 MiB chunks, so the
@@ -58,6 +61,10 @@ pub const STAMP_MARGIN: TimeDelta = TimeDelta::seconds(1);
 /// The most messages the writer takes from its channel at once.
 const BATCH_SIZE: usize = 1024;
 
+/// How long after asking for a snapshot of a symbol whose level change
+/// found no book the writer waits before asking again.
+const BOOKLESS_RESNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+
 /// What the writer thread is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterMessage {
@@ -65,7 +72,8 @@ pub enum WriterMessage {
     Event(FeedEvent),
     /// Write a final snapshot of the symbol's book, then drop the book, for a
     /// market that has stopped trading. Every later event for the symbol is
-    /// dropped until a [`Track`](Self::Track) for it.
+    /// dropped until a [`Track`](Self::Track) for it, or until
+    /// [`FORGOTTEN_RETENTION`] has passed.
     Forget(Arc<str>),
     /// Accept events for a symbol again after a [`Forget`](Self::Forget),
     /// for a market that has been registered again. Its book restarts from
@@ -139,6 +147,8 @@ pub struct WriterStats {
     /// Resnapshot requests lost because the request channel was full or
     /// closed.
     pub resnapshot_requests_dropped: u64,
+    /// Resnapshot requests for symbols whose level changes found no book.
+    pub bookless_resnapshot_requests: u64,
 }
 
 /// The running writer thread.
@@ -213,8 +223,12 @@ fn run(
 struct BookWriter {
     output: SbeOutput,
     books: HashMap<Arc<str>, TrackedBook>,
-    /// Symbols whose events are dropped until they are tracked again.
-    forgotten: HashSet<Arc<str>>,
+    /// Symbols whose events are dropped until they are tracked again or
+    /// their retention runs out.
+    forgotten: Forgotten,
+    /// Symbols without a book whose level changes asked for a snapshot,
+    /// and when.
+    bookless: HashMap<Arc<str>, Instant>,
     schedule: SnapshotSchedule,
     /// The latest receive time of any event processed.
     clock: DateTime<Utc>,
@@ -258,7 +272,8 @@ impl BookWriter {
         Self {
             output,
             books: HashMap::new(),
-            forgotten: HashSet::new(),
+            forgotten: Forgotten::default(),
+            bookless: HashMap::new(),
             schedule: SnapshotSchedule::new(config.snapshot_slots),
             clock: DateTime::UNIX_EPOCH,
             resnapshot_requests: config.resnapshot_requests.clone(),
@@ -285,7 +300,10 @@ impl BookWriter {
                     }
                     self.handle_batch(&mut batch)?;
                 }
-                _ = snapshot_timer.tick() => self.write_due_snapshots()?,
+                _ = snapshot_timer.tick() => {
+                    self.forgotten.prune(Instant::now());
+                    self.write_due_snapshots()?;
+                }
                 _ = next_tick(&mut flush_timer) => self.output.flush()?,
             }
         }
@@ -328,6 +346,7 @@ impl BookWriter {
         bids: &[(i64, i64)],
         asks: &[(i64, i64)],
     ) -> anyhow::Result<()> {
+        self.bookless.remove(&event.symbol);
         let tracked = self
             .books
             .entry(event.symbol.clone())
@@ -365,9 +384,24 @@ impl BookWriter {
         })
     }
 
-    fn drop_before_snapshot(&mut self, symbol: &str) {
+    /// Counts a level change for a symbol with no book, and asks for a
+    /// snapshot of the symbol, at most once per
+    /// [`BOOKLESS_RESNAPSHOT_INTERVAL`]. The book may never have started
+    /// because the snapshot that would start it was lost, so without a new
+    /// one the symbol would stay unrecorded.
+    fn drop_before_snapshot(&mut self, symbol: &Arc<str>) {
         self.stats.dropped_before_snapshot += 1;
-        tracing::debug!(symbol, "dropped a level change before the first snapshot");
+        tracing::debug!(%symbol, "dropped a level change before the first snapshot");
+        let now = Instant::now();
+        let asked_at = self.bookless.get(symbol);
+        if asked_at.is_some_and(|at| now.duration_since(*at) < BOOKLESS_RESNAPSHOT_INTERVAL) {
+            return;
+        }
+        if self.request_resnapshot(symbol) {
+            tracing::info!(%symbol, "asked for a snapshot of a symbol with no book");
+            self.stats.bookless_resnapshot_requests += 1;
+            self.bookless.insert(symbol.clone(), now);
+        }
     }
 
     /// Counts and logs an inconsistent book, and asks for a fresh snapshot
@@ -375,33 +409,39 @@ impl BookWriter {
     fn report_inconsistent(&mut self, symbol: &Arc<str>, price: i64) {
         self.stats.inconsistent += 1;
         tracing::warn!(%symbol, price, "level change left the book inconsistent");
-        let Some(tracked) = self.books.get_mut(symbol) else {
+        let tracked = self.books.get(symbol);
+        let pending = tracked.map(|tracked| tracked.resnapshot_requested);
+        if pending != Some(false) || !self.request_resnapshot(symbol) {
             return;
+        }
+        if let Some(tracked) = self.books.get_mut(symbol) {
+            tracked.resnapshot_requested = true;
+        }
+    }
+
+    /// Asks the coordinator for a fresh snapshot of `symbol`; false, counted
+    /// and logged, if the request channel is full or closed.
+    fn request_resnapshot(&mut self, symbol: &Arc<str>) -> bool {
+        let Err(error) = self.resnapshot_requests.try_send(symbol.clone()) else {
+            return true;
         };
-        if tracked.resnapshot_requested {
-            return;
-        }
-        match self.resnapshot_requests.try_send(symbol.clone()) {
-            Ok(()) => tracked.resnapshot_requested = true,
-            Err(error) => {
-                self.stats.resnapshot_requests_dropped += 1;
-                tracing::warn!(%symbol, %error, "dropped a resnapshot request");
-            }
-        }
+        self.stats.resnapshot_requests_dropped += 1;
+        tracing::warn!(%symbol, %error, "dropped a resnapshot request");
+        false
     }
 
     /// Marks the symbol forgotten, and writes a final snapshot of its book,
     /// if it has one, and drops the book.
     fn forget(&mut self, symbol: Arc<str>) -> anyhow::Result<()> {
+        self.forgotten.insert(symbol.clone(), Instant::now());
+        self.bookless.remove(&symbol);
         let Some(mut tracked) = self.books.remove(&symbol) else {
             tracing::debug!(%symbol, "forgot a symbol with no book");
-            self.forgotten.insert(symbol);
             return Ok(());
         };
         self.schedule.remove(&symbol, tracked.slot);
         let received_at = tracked.advance_to(self.own_snapshot_time());
         let snapshot = tracked.book.to_snapshot(&symbol, received_at);
-        self.forgotten.insert(symbol);
         self.output.write_snapshot(&snapshot)
     }
 

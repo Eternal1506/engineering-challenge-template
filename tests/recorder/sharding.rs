@@ -192,17 +192,49 @@ async fn re_adding_a_market_on_its_old_shard_requests_a_fresh_snapshot() {
     );
 }
 
+/// A's old shard holds B and C and D's shard has more room, yet A goes back
+/// to its old shard, so its old subscription's last messages come before
+/// its new snapshot on one connection.
 #[tokio::test]
-async fn re_adding_a_market_on_another_shard_records_its_new_book() {
+async fn a_re_added_market_goes_back_to_its_previous_shard() {
     let server = MockServer::start().await;
     let (mut pipeline, mut shards) = two_shards(&server).await;
     pipeline.coordinator.remove_market("A".into()).await;
     pipeline.coordinator.add_markets(open_markets(&["A"])).await;
+    let old = next_commands(owner_of(&mut shards, "B"), 3).await;
     let other = owner_of(&mut shards, "D");
+    other
+        .client
+        .assert_no_command(Duration::from_millis(300))
+        .await;
+    shut_down(pipeline, shards).await;
+    let a = names(&["A"]);
+    let expected = [("remove", a.clone()), ("add", a.clone()), ("snapshot", a)];
+    let expected = expected.map(|(cmd, symbols)| (cmd.to_owned(), symbols));
+    assert_eq!(old, expected);
+}
+
+/// With shards of two, A and B on one and C on the other: A is removed and
+/// X fills its slot, so A comes back on C's shard.
+#[tokio::test]
+async fn a_re_added_market_whose_old_shard_is_full_records_its_new_book_on_another() {
+    let server = MockServer::start().await;
+    let mut pipeline = Pipeline::new(&server, config(2));
+    let markets = open_markets(&["A", "B", "C"]);
+    pipeline.coordinator.add_markets(markets).await;
+    let mut shards = Shard::accept_all(&server, 2).await;
+    for shard in &mut shards {
+        shard.send_books().await;
+    }
+    pipeline.output.wait_for(3, 0).await;
+    pipeline.coordinator.remove_market("A".into()).await;
+    pipeline.coordinator.add_markets(open_markets(&["X"])).await;
+    pipeline.coordinator.add_markets(open_markets(&["A"])).await;
+    let other = owner_of(&mut shards, "C");
     let add = other.client.next_command().await;
     let frame = frames::book(other.sub, other.next_seq(), "A", (BIDS, ASKS));
     other.client.reply(&add, frame).await;
-    pipeline.output.wait_for(6, 0).await;
+    pipeline.output.wait_for(5, 0).await;
     let finished = shut_down(pipeline, shards).await;
     assert_eq!(
         (add.cmd.as_str(), add.symbols, finished.of("A")),
