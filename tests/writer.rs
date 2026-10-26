@@ -134,7 +134,7 @@ fn a_full_resnapshot_channel_counts_the_dropped_request() -> anyhow::Result<()> 
 }
 
 #[test]
-fn forget_writes_a_final_snapshot_at_the_writer_clock_and_drops_the_book() -> anyhow::Result<()> {
+fn forget_writes_a_final_snapshot_and_drops_the_book() -> anyhow::Result<()> {
     let output = NamedTempFile::new()?;
     let snapshot = feed_snapshot("A", &[(400_000, UNIT)], &[(600_000, UNIT)]);
     let messages = vec![
@@ -152,6 +152,20 @@ fn forget_writes_a_final_snapshot_at_the_writer_clock_and_drops_the_book() -> an
     ];
     assert_eq!(run.messages, expected);
     assert_eq!(run.stats.dropped_forgotten, 1);
+    Ok(())
+}
+
+#[test]
+fn the_final_snapshot_is_stamped_the_margin_behind_the_writer_clock() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let messages = vec![
+        stamped(feed_snapshot("A", &[(400_000, UNIT)], &[]), 0, None),
+        stamped(feed_snapshot("B", &[(400_000, UNIT)], &[]), 5000, None),
+        forget("A"),
+    ];
+    let run = run_writer(output.path(), messages, |_| {})?;
+    let final_snapshot = snapshot_message("A", (4000, 4000), (&[(400_000, UNIT)], &[]));
+    assert_eq!(run.messages.last(), Some(&final_snapshot));
     Ok(())
 }
 

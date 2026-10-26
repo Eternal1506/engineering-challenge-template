@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use common::{
-    Recorded, at, feed_level, feed_snapshot, forget, level, read_recording, run_live,
+    Recorded, at, feed_level, feed_snapshot, forget, level, read_recording, received_at, run_live,
     snapshot_sides, stamped, track, verify_clean,
 };
 use engineering_challenge::Side;
@@ -111,27 +111,50 @@ fn quiet_books_are_snapshotted_at_the_advancing_stream_clock() -> anyhow::Result
     Ok(())
 }
 
-#[test]
-fn an_event_lagging_less_than_the_margin_keeps_its_true_time() -> anyhow::Result<()> {
+/// Snapshots A at 0 and B at `clock_ms`, lets the writer tick for 50 ms,
+/// then sends a lagging update to A stamped `update_ms`. Returns the output.
+fn run_with_lagging_update(clock_ms: i64, update_ms: i64) -> anyhow::Result<Vec<Recorded>> {
     let output = NamedTempFile::new()?;
     let snapshot = |symbol| feed_snapshot(symbol, &[(500_000, UNIT)], &[]);
     let lagging = feed_level("A", level(Side::Buy, 500_000, Delta(1)));
     run_live(output.path(), ticks(1, 1), |sender| {
         sender.blocking_send(stamped(snapshot("A"), 0, None))?;
-        sender.blocking_send(stamped(snapshot("B"), 1000, None))?;
+        sender.blocking_send(stamped(snapshot("B"), clock_ms, None))?;
         std::thread::sleep(Duration::from_millis(50));
-        sender.blocking_send(stamped(lagging, 500, None))?;
+        sender.blocking_send(stamped(lagging, update_ms, None))?;
         Ok(())
     })?;
-    let recorded = read_recording(output.path())?;
-    let a_snapshots = snapshot_times(&recorded)["A"].len();
-    let a_update_times: Vec<_> = recorded
+    read_recording(output.path())
+}
+
+/// How many snapshots of A precede the only update in `recorded`, and that
+/// update's receive time.
+fn snapshots_before_the_update(recorded: &[Recorded]) -> (usize, Option<DateTime<Utc>>) {
+    let position = recorded
         .iter()
-        .filter(|message| matches!(message, Recorded::Update(_)))
-        .map(common::received_at)
-        .collect();
-    assert!(a_snapshots >= 2, "no periodic snapshot of A: {recorded:?}");
-    assert_eq!(a_update_times, [at(500)]);
+        .position(|message| matches!(message, Recorded::Update(_)));
+    let before = &recorded[..position.unwrap_or(recorded.len())];
+    let of_a = |message: &&Recorded| matches!(message, Recorded::Snapshot(s) if s.symbol == "A");
+    let a_snapshots = before.iter().filter(of_a).count();
+    let update_time = position.map(|index| received_at(&recorded[index]));
+    (a_snapshots, update_time)
+}
+
+#[test]
+fn an_event_lagging_less_than_the_margin_keeps_its_true_time() -> anyhow::Result<()> {
+    let recorded = run_with_lagging_update(1000, 500)?;
+    let (a_snapshots, update_time) = snapshots_before_the_update(&recorded);
+    assert!(a_snapshots >= 2, "no own snapshot of A first: {recorded:?}");
+    assert_eq!(update_time, Some(at(500)));
+    Ok(())
+}
+
+#[test]
+fn an_event_lagging_more_than_the_margin_is_floored_to_the_snapshot() -> anyhow::Result<()> {
+    let recorded = run_with_lagging_update(2000, 800)?;
+    let (a_snapshots, update_time) = snapshots_before_the_update(&recorded);
+    assert!(a_snapshots >= 2, "no own snapshot of A first: {recorded:?}");
+    assert_eq!(update_time, Some(at(1000)));
     Ok(())
 }
 
