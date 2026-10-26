@@ -1,3 +1,4 @@
 /target/
 /secrets/
+/.claude/worktrees/
 *.pem
