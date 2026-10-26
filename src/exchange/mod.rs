@@ -80,6 +80,17 @@ pub trait FeedEndpoint {
     fn handshake_headers(&self, now: DateTime<Utc>) -> Vec<(&'static str, String)>;
 }
 
+/// A shared endpoint, so that many connections can use one.
+impl<T: FeedEndpoint + ?Sized> FeedEndpoint for Arc<T> {
+    fn url(&self) -> &str {
+        (**self).url()
+    }
+
+    fn handshake_headers(&self, now: DateTime<Utc>) -> Vec<(&'static str, String)> {
+        (**self).handshake_headers(now)
+    }
+}
+
 /// Translates between an exchange's websocket messages and the core's
 /// [`Command`] and [`Decoded`] types.
 pub trait FeedCodec {
@@ -102,4 +113,20 @@ pub trait FeedCodec {
         received_at: DateTime<Utc>,
         out: &mut Vec<Decoded>,
     ) -> anyhow::Result<()>;
+}
+
+/// A shared codec, so that many connections can use one.
+impl<T: FeedCodec + ?Sized> FeedCodec for Arc<T> {
+    fn encode(&self, command: &Command) -> String {
+        (**self).encode(command)
+    }
+
+    fn decode(
+        &self,
+        text: &str,
+        received_at: DateTime<Utc>,
+        out: &mut Vec<Decoded>,
+    ) -> anyhow::Result<()> {
+        (**self).decode(text, received_at, out)
+    }
 }

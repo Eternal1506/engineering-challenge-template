@@ -5,9 +5,11 @@
 //!
 //! - `subscribed`: `sub`, `reply_to`;
 //! - `ack`: `sub`, `seq`, `reply_to`;
-//! - `snapshot`: `sub`, `seq`, `symbol`, and `reply_to` when it answers a
-//!   snapshot request;
-//! - `delta`: `sub`, `seq`, `symbol`, `price`, `qty`;
+//! - `snapshot`: `sub`, `seq`, `symbol`, optional `bids` and `asks` as
+//!   `[price, qty]` pairs (empty if absent), and `reply_to` when it answers
+//!   a snapshot request;
+//! - `delta`: `sub`, `seq`, `symbol`, `price`, `qty` (a signed change), and
+//!   optional `side`, `"buy"` (the default) or `"sell"`;
 //! - `error`: `code` (25 is an overflow), and optionally `sub`, `reply_to`.
 //!
 //! Any other kind, or text that is not JSON, fails to decode. Commands to
@@ -89,6 +91,12 @@ struct Frame {
     price: i64,
     #[serde(default)]
     qty: i64,
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    bids: Vec<(i64, i64)>,
+    #[serde(default)]
+    asks: Vec<(i64, i64)>,
     code: Option<i64>,
 }
 
@@ -111,8 +119,8 @@ impl Frame {
                 sub: self.sub()?,
                 symbols: None,
             },
-            "snapshot" => Inbound::Feed(self.feed(received_at, empty_book())?),
-            "delta" => Inbound::Feed(self.feed(received_at, self.level())?),
+            "snapshot" => Inbound::Feed(self.feed(received_at, self.book())?),
+            "delta" => Inbound::Feed(self.feed(received_at, self.level()?)?),
             "error" => Inbound::Error {
                 sub: self.sub.map(SubId),
                 kind: error_kind(self.code.context("error frame without code")?),
@@ -135,23 +143,28 @@ impl Frame {
         })
     }
 
-    fn level(&self) -> FeedBody {
-        FeedBody::Level(LevelChange {
-            side: Side::Buy,
+    fn book(&self) -> FeedBody {
+        FeedBody::Snapshot {
+            bids: self.bids.clone(),
+            asks: self.asks.clone(),
+        }
+    }
+
+    fn level(&self) -> anyhow::Result<FeedBody> {
+        let side = match self.side.as_deref() {
+            None | Some("buy") => Side::Buy,
+            Some("sell") => Side::Sell,
+            Some(other) => anyhow::bail!("unknown side {other:?}"),
+        };
+        Ok(FeedBody::Level(LevelChange {
+            side,
             price: self.price,
             change: QuantityChange::Delta(self.qty),
-        })
+        }))
     }
 
     fn sub(&self) -> anyhow::Result<SubId> {
         self.sub.map(SubId).context("frame without sub")
-    }
-}
-
-fn empty_book() -> FeedBody {
-    FeedBody::Snapshot {
-        bids: Vec::new(),
-        asks: Vec::new(),
     }
 }
 
@@ -202,9 +215,26 @@ pub mod frames {
         json!({ "kind": "snapshot", "sub": sub, "seq": seq, "symbol": symbol })
     }
 
+    /// `(price, qty)` levels of one side of a book.
+    pub type Levels<'a> = &'a [(i64, i64)];
+
+    /// A book for `symbol` on subscription `sub`, at `seq`, with `sides` as
+    /// its bids and asks.
+    pub fn book(sub: u64, seq: u64, symbol: &str, sides: (Levels<'_>, Levels<'_>)) -> Value {
+        let (bids, asks) = sides;
+        json!({ "kind": "snapshot", "sub": sub, "seq": seq, "symbol": symbol, "bids": bids, "asks": asks })
+    }
+
     /// A bid change for `symbol` on subscription `sub`, at `seq`.
     pub fn delta(sub: u64, seq: u64, symbol: &str) -> Value {
         json!({ "kind": "delta", "sub": sub, "seq": seq, "symbol": symbol, "price": 500_000, "qty": 10 })
+    }
+
+    /// A change of `qty` to the `side` (`"buy"` or `"sell"`) level of
+    /// `symbol` at `price`, on subscription `sub`, at `seq`.
+    pub fn level(sub: u64, seq: u64, symbol: &str, change: (&str, i64, i64)) -> Value {
+        let (side, price, qty) = change;
+        json!({ "kind": "delta", "sub": sub, "seq": seq, "symbol": symbol, "side": side, "price": price, "qty": qty })
     }
 
     /// An error with `code`, not in reply to any command.
