@@ -93,6 +93,33 @@ fn a_level_change_before_the_first_snapshot_is_dropped_and_counted() -> anyhow::
     Ok(())
 }
 
+/// The book may never have started because its snapshot was lost, so the
+/// writer asks for one, but only once within the rate limit.
+#[test]
+fn level_changes_with_no_book_ask_for_one_snapshot_within_the_rate_limit() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let change = |received| stamped(feed_level("A", bid(400_000, Delta(UNIT))), received, None);
+    let run = run_writer(output.path(), vec![change(1), change(2), change(3)], |_| {})?;
+    let requested: Vec<&str> = run.resnapshot_requests.iter().map(|s| &**s).collect();
+    let asked = run.stats.bookless_resnapshot_requests;
+    let dropped = run.stats.dropped_before_snapshot;
+    assert_eq!((requested, asked, dropped), (vec!["A"], 1, 3));
+    Ok(())
+}
+
+#[test]
+fn a_level_change_for_a_forgotten_symbol_asks_for_nothing() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let change = stamped(feed_level("A", bid(400_000, Delta(UNIT))), 1, None);
+    let run = run_writer(output.path(), vec![forget("A"), change], |_| {})?;
+    let stats = &run.stats;
+    assert_eq!(
+        (run.resnapshot_requests.len(), stats.dropped_forgotten),
+        (0, 1)
+    );
+    Ok(())
+}
+
 #[test]
 fn an_inconsistent_change_requests_one_resnapshot_until_the_next_snapshot() -> anyhow::Result<()> {
     let output = NamedTempFile::new()?;

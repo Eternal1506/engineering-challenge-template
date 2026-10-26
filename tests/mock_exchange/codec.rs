@@ -10,7 +10,11 @@
 //!   a snapshot request;
 //! - `delta`: `sub`, `seq`, `symbol`, `price`, `qty` (a signed change), and
 //!   optional `side`, `"buy"` (the default) or `"sell"`;
-//! - `error`: `code` (25 is an overflow), and optionally `sub`, `reply_to`.
+//! - `error`: `code` (25 is an overflow), and optionally `sub`, `reply_to`;
+//! - `lifecycle`: `sub`, `seq`, `symbol`, `event` (`created`, `activated`,
+//!   `deactivated`, `close_changed`, `determined` or `settled`), and
+//!   `open_ts` and `close_ts` in Unix milliseconds where the event has
+//!   them (`close_changed` requires `close_ts`).
 //!
 //! Any other kind, or text that is not JSON, fails to decode. Commands to
 //! the exchange are `{"cmd", "id", "sub", "symbols"}`, read back as
@@ -22,8 +26,8 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use engineering_challenge::Side;
 use engineering_challenge::core::events::{
-    Command, Decoded, FeedBody, FeedErrorKind, FeedEvent, Inbound, LevelChange, QuantityChange,
-    StreamPosition, SubId,
+    Command, Decoded, FeedBody, FeedErrorKind, FeedEvent, Inbound, LevelChange, LifecycleEvent,
+    QuantityChange, StreamPosition, SubId,
 };
 use engineering_challenge::exchange::FeedCodec;
 use serde::Deserialize;
@@ -98,6 +102,9 @@ struct Frame {
     #[serde(default)]
     asks: Vec<(i64, i64)>,
     code: Option<i64>,
+    event: Option<String>,
+    open_ts: Option<i64>,
+    close_ts: Option<i64>,
 }
 
 impl Frame {
@@ -125,7 +132,30 @@ impl Frame {
                 sub: self.sub.map(SubId),
                 kind: error_kind(self.code.context("error frame without code")?),
             },
+            "lifecycle" => Inbound::Lifecycle(self.lifecycle()?),
             other => anyhow::bail!("unknown frame kind {other:?}"),
+        })
+    }
+
+    fn lifecycle(&self) -> anyhow::Result<LifecycleEvent> {
+        let symbol = self.symbol.as_deref().context("lifecycle without symbol")?;
+        let symbol: Arc<str> = symbol.into();
+        let event = self.event.as_deref().context("lifecycle without event")?;
+        Ok(match event {
+            "created" => LifecycleEvent::Created {
+                symbol,
+                open_ts: millis(self.open_ts),
+                close_ts: millis(self.close_ts),
+            },
+            "activated" => LifecycleEvent::Activated { symbol },
+            "deactivated" => LifecycleEvent::Deactivated { symbol },
+            "close_changed" => LifecycleEvent::CloseChanged {
+                symbol,
+                close_ts: millis(self.close_ts).context("close_changed without close_ts")?,
+            },
+            "determined" => LifecycleEvent::Determined { symbol },
+            "settled" => LifecycleEvent::Settled { symbol },
+            other => anyhow::bail!("unknown lifecycle event {other:?}"),
         })
     }
 
@@ -166,6 +196,11 @@ impl Frame {
     fn sub(&self) -> anyhow::Result<SubId> {
         self.sub.map(SubId).context("frame without sub")
     }
+}
+
+/// The time `ms` Unix milliseconds stand for, if given and in range.
+fn millis(ms: Option<i64>) -> Option<DateTime<Utc>> {
+    ms.and_then(DateTime::from_timestamp_millis)
 }
 
 fn error_kind(code: i64) -> FeedErrorKind {
@@ -240,5 +275,12 @@ pub mod frames {
     /// An error with `code`, not in reply to any command.
     pub fn error(code: i64) -> Value {
         json!({ "kind": "error", "code": code })
+    }
+
+    /// A lifecycle `event` for `symbol` on subscription `sub`, at `seq`.
+    /// Set `open_ts` and `close_ts`, in Unix milliseconds, on the frame for
+    /// events that carry them.
+    pub fn lifecycle(sub: u64, seq: u64, event: &str, symbol: &str) -> Value {
+        json!({ "kind": "lifecycle", "sub": sub, "seq": seq, "event": event, "symbol": symbol })
     }
 }

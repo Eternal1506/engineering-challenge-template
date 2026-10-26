@@ -6,6 +6,8 @@ mod common;
 #[path = "mock_exchange/mod.rs"]
 mod mock_exchange;
 
+#[path = "recorder/lifecycle.rs"]
+mod lifecycle;
 #[path = "recorder/recovery.rs"]
 mod recovery;
 #[path = "recorder/sharding.rs"]
@@ -21,14 +23,17 @@ use std::time::Duration;
 
 use common::{Levels, Recorded, read_recording, snapshot_sides, verify_clean};
 use engineering_challenge::Side;
-use engineering_challenge::core::coordinator::{Coordinator, CoordinatorConfig, Feed, WriterLink};
+use engineering_challenge::core::coordinator::{
+    Coordinator, CoordinatorConfig, Feed, LifecycleTimings, WriterLink,
+};
 use engineering_challenge::core::stats::RecorderCounters;
 use engineering_challenge::core::writer::{
     WriterConfig, WriterHandle, WriterProgress, WriterStats, spawn_writer,
 };
 use engineering_challenge::core::ws::ConnectionConfig;
 use mock_exchange::{
-    CatalogPages, MockCatalog, MockClient, MockCodec, MockEndpoint, MockServer, frames,
+    CatalogPages, CatalogWalks, MockCatalog, MockClient, MockCodec, MockEndpoint, MockServer,
+    frames,
 };
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -42,8 +47,9 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const BIDS: &[(i64, i64)] = &[(400_000, 100)];
 const ASKS: &[(i64, i64)] = &[(600_000, 50)];
 
-/// A coordinator with shards of `shard_size`, quick reconnects, and no
-/// stats line during a test.
+/// A coordinator with shards of `shard_size`, quick reconnects, no stats
+/// line during a test, subscription changes batched for 100 ms, a sweep
+/// every 100 ms and no reconcile within a test.
 fn config(shard_size: usize) -> CoordinatorConfig {
     CoordinatorConfig {
         shard_size,
@@ -55,14 +61,29 @@ fn config(shard_size: usize) -> CoordinatorConfig {
         shard_event_capacity: 1024,
         stats_interval: Duration::from_secs(3600),
         stall_timeout: Duration::from_secs(2),
+        lifecycle: LifecycleTimings {
+            batch_window: Duration::from_millis(100),
+            sweep_interval: Duration::from_millis(100),
+            reconcile_interval: Duration::from_secs(3600),
+        },
     }
 }
 
-/// The mock exchange's feed at `server`.
+/// The mock exchange's feed at `server`, without lifecycle changes.
 fn mock_feed(server: &MockServer) -> Feed<MockEndpoint, MockCodec> {
     Feed {
         endpoint: server.endpoint(),
+        lifecycle_endpoint: None,
         codec: MockCodec::default(),
+    }
+}
+
+/// The mock exchange's feed at `server`, with lifecycle changes from
+/// `lifecycle`.
+fn following_feed(server: &MockServer, lifecycle: &MockServer) -> Feed<MockEndpoint, MockCodec> {
+    Feed {
+        lifecycle_endpoint: Some(lifecycle.endpoint()),
+        ..mock_feed(server)
     }
 }
 
@@ -102,6 +123,10 @@ struct Output {
 
 impl Pipeline {
     fn new(server: &MockServer, config: CoordinatorConfig) -> Self {
+        Self::with_feed(mock_feed(server), config)
+    }
+
+    fn with_feed(feed: Feed<MockEndpoint, MockCodec>, config: CoordinatorConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recording.sbe");
         let (link, writer) = start_writer(&path, |_| {});
@@ -111,7 +136,7 @@ impl Pipeline {
             path,
             _dir: dir,
         };
-        let coordinator = Coordinator::new(mock_feed(server), link, config);
+        let coordinator = Coordinator::new(feed, link, config);
         Self {
             coordinator,
             output,
@@ -213,12 +238,30 @@ impl Recorder {
 
     /// [`Recorder::start`] with `config`.
     fn start_with(server: &MockServer, config: CoordinatorConfig) -> Self {
+        let (catalog, pages) = MockCatalog::new();
+        Self::run(Pipeline::new(server, config), catalog, pages)
+    }
+
+    /// Starts recording from `server` with `config`, following lifecycle
+    /// changes from `lifecycle`. Returns the recorder and the script for
+    /// the catalog's listings after the startup walk.
+    fn following(
+        server: &MockServer,
+        lifecycle: &MockServer,
+        config: CoordinatorConfig,
+    ) -> (Self, CatalogWalks) {
+        let (catalog, pages) = MockCatalog::new();
+        let walks = catalog.walks();
+        let pipeline = Pipeline::with_feed(following_feed(server, lifecycle), config);
+        (Self::run(pipeline, catalog, pages), walks)
+    }
+
+    fn run(pipeline: Pipeline, catalog: MockCatalog, pages: CatalogPages) -> Self {
         let Pipeline {
             coordinator,
             output,
-        } = Pipeline::new(server, config);
+        } = pipeline;
         let counters = coordinator.counters();
-        let (catalog, pages) = MockCatalog::new();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(coordinator.run(catalog, cancel.clone()));
         Self {

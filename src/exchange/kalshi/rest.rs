@@ -19,9 +19,17 @@ const PAGE_LIMIT: &str = "1000";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ERROR_BODY_PREVIEW_CHARS: usize = 200;
+
+/// The steady request rate. Live walks at 15 per second with bursts of 5
+/// drew a 429 about every 2 s.
+const REQUESTS_PER_SECOND: u32 = 10;
+
+/// The most requests sent back to back. One keeps the pacing even.
+const REQUEST_BURST: u32 = 1;
+
 const PRODUCTION_LIMITS: CatalogLimits = CatalogLimits {
-    requests_per_second: 15,
-    burst: 5,
+    requests_per_second: REQUESTS_PER_SECOND,
+    burst: REQUEST_BURST,
     backoff: Backoff {
         first_delay: Duration::from_secs(1),
         max_delay: Duration::from_secs(30),
@@ -32,7 +40,7 @@ const PRODUCTION_LIMITS: CatalogLimits = CatalogLimits {
 
 /// Lists regular (non-multivariate) Kalshi markets from `GET /markets`.
 ///
-/// Requests are paced at 15 per second with bursts of up to 5, and a 429, a
+/// Requests are paced at 10 per second, one at a time, and a 429, a
 /// 5xx or a transport error is retried with exponential backoff (1 s doubling
 /// to 30 s, 8 attempts). A listing stops with an error after 10,000 pages.
 ///

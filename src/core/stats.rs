@@ -13,7 +13,21 @@ use crate::core::writer::{WriterMessage, WriterProgress};
 /// The default time between two stats lines.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Counts the shard tasks keep as they run, read by the stats line.
+/// What made the coordinator start or stop recording a market after
+/// startup. The markets the startup listing records are not counted by
+/// cause; the stats line's market count includes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeCause {
+    /// A lifecycle event.
+    Lifecycle,
+    /// The sweep, as an open or close time passed.
+    Sweep,
+    /// A reconcile with the catalog.
+    Reconcile,
+}
+
+/// Counts the shard tasks and the coordinator keep as they run, read by the
+/// stats line.
 #[derive(Debug, Default)]
 pub struct RecorderCounters {
     events_forwarded: AtomicU64,
@@ -22,6 +36,48 @@ pub struct RecorderCounters {
     gaps: AtomicU64,
     resync_drops: AtomicU64,
     resnapshot_requests: AtomicU64,
+    lifecycle_events: AtomicU64,
+    added: CauseCounters,
+    removed: CauseCounters,
+    reconciles: AtomicU64,
+}
+
+/// One count per [`ChangeCause`].
+#[derive(Debug, Default)]
+struct CauseCounters {
+    lifecycle: AtomicU64,
+    sweep: AtomicU64,
+    reconcile: AtomicU64,
+}
+
+/// One reading of a count per [`ChangeCause`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CauseCounts {
+    /// Changes made for lifecycle events.
+    pub lifecycle: u64,
+    /// Changes made by the sweep.
+    pub sweep: u64,
+    /// Changes made by reconciles.
+    pub reconcile: u64,
+}
+
+impl CauseCounters {
+    fn note(&self, cause: ChangeCause) {
+        let counter = match cause {
+            ChangeCause::Lifecycle => &self.lifecycle,
+            ChangeCause::Sweep => &self.sweep,
+            ChangeCause::Reconcile => &self.reconcile,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> CauseCounts {
+        CauseCounts {
+            lifecycle: self.lifecycle.load(Ordering::Relaxed),
+            sweep: self.sweep.load(Ordering::Relaxed),
+            reconcile: self.reconcile.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// One reading of every [`RecorderCounters`] count.
@@ -39,6 +95,14 @@ pub struct CounterValues {
     pub resync_drops: u64,
     /// Fresh snapshots requested for inconsistent books.
     pub resnapshot_requests: u64,
+    /// Market lifecycle events received.
+    pub lifecycle_events: u64,
+    /// Markets the coordinator started recording, by cause.
+    pub added: CauseCounts,
+    /// Markets the coordinator stopped recording, by cause.
+    pub removed: CauseCounts,
+    /// Reconciles with the catalog that finished, failed or not.
+    pub reconciles: u64,
 }
 
 impl RecorderCounters {
@@ -78,6 +142,26 @@ impl RecorderCounters {
         self.resnapshot_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A market lifecycle event arrived.
+    pub fn note_lifecycle_event(&self) {
+        self.lifecycle_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The coordinator started recording a market because of `cause`.
+    pub fn note_added(&self, cause: ChangeCause) {
+        self.added.note(cause);
+    }
+
+    /// The coordinator stopped recording a market because of `cause`.
+    pub fn note_removed(&self, cause: ChangeCause) {
+        self.removed.note(cause);
+    }
+
+    /// A reconcile with the catalog finished.
+    pub fn note_reconcile(&self) {
+        self.reconciles.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The current counts.
     pub fn read(&self) -> CounterValues {
         CounterValues {
@@ -87,18 +171,36 @@ impl RecorderCounters {
             gaps: self.gaps.load(Ordering::Relaxed),
             resync_drops: self.resync_drops.load(Ordering::Relaxed),
             resnapshot_requests: self.resnapshot_requests.load(Ordering::Relaxed),
+            lifecycle_events: self.lifecycle_events.load(Ordering::Relaxed),
+            added: self.added.read(),
+            removed: self.removed.read(),
+            reconciles: self.reconciles.load(Ordering::Relaxed),
         }
     }
+}
+
+/// How many shards and markets the coordinator has, for the stats line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Census {
+    /// Shards open.
+    pub shards: usize,
+    /// Markets recorded.
+    pub markets: usize,
+    /// Markets known, recorded or not: waiting to open, or ended but not
+    /// yet forgotten.
+    pub known: usize,
 }
 
 /// Samples the writer channel's depth and logs the stats line at info,
 /// once per interval.
 ///
-/// The line has the shard count, connections up and down, events forwarded
-/// per second since the last line, snapshots and updates written, the writer
-/// channel's depth and its peak since startup, and the resnapshot request,
-/// gap, resync drop and disconnect totals. A sample above half the
-/// channel's capacity is logged at warn when the depth crosses that mark.
+/// The line has the shard count, the markets recorded and known,
+/// connections up and down, events forwarded per second since the last
+/// line, snapshots and updates written, the writer channel's depth and its
+/// peak since startup, and the totals of resnapshot requests, gaps, resync
+/// drops, disconnects, lifecycle events, markets added and removed by each
+/// [`ChangeCause`], and reconciles. A sample above half the channel's
+/// capacity is logged at warn when the depth crosses that mark.
 #[derive(Debug)]
 pub struct StatsReporter {
     counters: Arc<RecorderCounters>,
@@ -130,22 +232,22 @@ impl StatsReporter {
     }
 
     /// Samples the depth of `writer`'s channel, and logs the stats line if
-    /// one is due, with `shards` as the shard count.
-    pub fn sample(&mut self, writer: &mpsc::Sender<WriterMessage>, shards: usize) {
+    /// one is due, with the coordinator's `census`.
+    pub fn sample(&mut self, writer: &mpsc::Sender<WriterMessage>, census: Census) {
         let capacity = writer.max_capacity();
         let depth = capacity - writer.capacity();
         self.peak_depth = self.peak_depth.max(depth);
         self.warn_when_over_half(depth, capacity);
         if self.last_line_at.elapsed() >= self.interval {
-            self.log_line(depth, shards);
+            self.log_line(depth, census);
         }
     }
 
     /// Logs the stats line now, with the writer channel's current depth.
-    pub fn log_now(&mut self, writer: &mpsc::Sender<WriterMessage>, shards: usize) {
+    pub fn log_now(&mut self, writer: &mpsc::Sender<WriterMessage>, census: Census) {
         let depth = writer.max_capacity() - writer.capacity();
         self.peak_depth = self.peak_depth.max(depth);
-        self.log_line(depth, shards);
+        self.log_line(depth, census);
     }
 
     fn warn_when_over_half(&mut self, depth: usize, capacity: usize) {
@@ -156,13 +258,16 @@ impl StatsReporter {
         self.over_half = over_half;
     }
 
-    fn log_line(&mut self, depth: usize, shards: usize) {
+    fn log_line(&mut self, depth: usize, census: Census) {
         let counts = self.counters.read();
         let events_per_sec = self.events_per_second(counts.events_forwarded);
+        let (added, removed) = (counts.added, counts.removed);
         tracing::info!(
-            shards,
+            shards = census.shards,
+            markets = census.markets,
+            known = census.known,
             up = counts.connections_up,
-            down = shards.saturating_sub(counts.connections_up),
+            down = census.shards.saturating_sub(counts.connections_up),
             events_per_sec,
             snapshots = self.progress.snapshots_written(),
             updates = self.progress.updates_written(),
@@ -172,6 +277,14 @@ impl StatsReporter {
             gaps = counts.gaps,
             resync_drops = counts.resync_drops,
             disconnects = counts.disconnects,
+            lifecycle_events = counts.lifecycle_events,
+            added_lifecycle = added.lifecycle,
+            removed_lifecycle = removed.lifecycle,
+            added_sweep = added.sweep,
+            removed_sweep = removed.sweep,
+            added_reconcile = added.reconcile,
+            removed_reconcile = removed.reconcile,
+            reconciles = counts.reconciles,
             "stats"
         );
     }
@@ -214,6 +327,24 @@ mod tests {
         assert_eq!((counts.connections_up, counts.disconnects), (0, 0));
     }
 
+    #[test]
+    fn changes_are_counted_by_cause() {
+        let counters = RecorderCounters::default();
+        counters.note_added(ChangeCause::Lifecycle);
+        counters.note_added(ChangeCause::Lifecycle);
+        counters.note_removed(ChangeCause::Sweep);
+        let counts = counters.read();
+        let added = CauseCounts {
+            lifecycle: 2,
+            ..CauseCounts::default()
+        };
+        let removed = CauseCounts {
+            sweep: 1,
+            ..CauseCounts::default()
+        };
+        assert_eq!((counts.added, counts.removed), (added, removed));
+    }
+
     #[tokio::test]
     async fn the_peak_depth_is_kept_after_the_channel_drains() {
         let (writer, mut receiver) = mpsc::channel(8);
@@ -225,9 +356,9 @@ mod tests {
                 .try_send(WriterMessage::Track(symbol.into()))
                 .unwrap();
         }
-        stats.sample(&writer, 1);
+        stats.sample(&writer, Census::default());
         while receiver.try_recv().is_ok() {}
-        stats.sample(&writer, 1);
+        stats.sample(&writer, Census::default());
         assert_eq!(stats.peak_depth, 3);
     }
 }

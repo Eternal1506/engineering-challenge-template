@@ -15,7 +15,7 @@ mod codec;
 mod server;
 
 #[allow(unused_imports, reason = "the connection tests list no markets")]
-pub use catalog::{CatalogPages, MockCatalog, market};
+pub use catalog::{CatalogPages, CatalogWalks, MockCatalog, market};
 pub use codec::{MockCodec, SentCommand, frames};
 #[allow(unused_imports, reason = "the connection tests build no coordinator")]
 pub use server::MockEndpoint;

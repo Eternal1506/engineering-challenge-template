@@ -1,43 +1,109 @@
-//! [`Registry`]: which shard records which market, and how full each shard
-//! is.
+//! [`Registry`]: which shard records which market, how full each shard is,
+//! and what changed since the shards were last told.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::core::shard::ShardId;
+use crate::core::writer::{DEFAULT_SNAPSHOT_TICK, FORGOTTEN_RETENTION};
+
+/// How far behind the registry the writer may be in processing a
+/// departed market's `Forget`: about a full writer channel, at the
+/// recorder's event rate.
+const WRITER_LAG_ALLOWANCE: Duration = Duration::from_secs(30);
+
+/// The longest snapshot tick allowed for. The writer prunes the symbols it
+/// has forgotten on every tick.
+const PRUNE_TICK_ALLOWANCE: Duration = Duration::from_secs(1);
+
+/// How long past [`FORGOTTEN_RETENTION`] the registry remembers a departed
+/// market. The writer starts the retention when it processes the market's
+/// `Forget`, up to [`WRITER_LAG_ALLOWANCE`] after the registry reported it
+/// departed, and drops the market up to a tick past the retention. The
+/// grace exceeds both together, so the registry keeps sending `Track` for a
+/// returning market for as long as the writer may still be dropping its
+/// events. A writer lagging even further is caught by the writer itself: a
+/// level change that finds no book asks for a fresh snapshot.
+const DEPARTED_GRACE: Duration = Duration::from_secs(60);
+
+const _: () = assert!(
+    DEPARTED_GRACE.as_millis()
+        > WRITER_LAG_ALLOWANCE.as_millis() + PRUNE_TICK_ALLOWANCE.as_millis()
+);
+const _: () = assert!(DEFAULT_SNAPSHOT_TICK.as_millis() <= PRUNE_TICK_ALLOWANCE.as_millis());
 
 /// The markets a coordinator records and the shard each one is on.
 ///
-/// A new market goes to the shard with the most free slots, the oldest
-/// first on a tie, and a new shard opens when every shard is full. Markets
-/// never move between shards. A shard whose last market is removed closes.
+/// A market removed and placed again before the next take goes back to its
+/// shard: slots freed since the last take stay reserved until it, so the
+/// old subscription's last messages and the new subscription's snapshot
+/// arrive on one connection, in order. A market that departed at an earlier
+/// take goes back to its last shard if that shard is still open and has
+/// room. Any other new market goes to the shard with the most free slots,
+/// the oldest first on a tie, and a new shard opens when every shard is
+/// full.
+///
+/// Changes collect until [`Registry::take_changes`], which reports their net
+/// effect per shard. A shard whose last market is removed stays open, and
+/// can take markets again, until then.
+///
+/// Departed markets are remembered for [`FORGOTTEN_RETENTION`] plus
+/// [`DEPARTED_GRACE`]. Once [`Registry::expire_departed`] drops one, it
+/// comes back as a new market, which the writer has stopped dropping by
+/// then unless it lagged by more than [`WRITER_LAG_ALLOWANCE`].
 #[derive(Debug)]
 pub(super) struct Registry {
     shard_size: usize,
     owners: HashMap<Arc<str>, ShardId>,
     shards: BTreeMap<ShardId, BTreeSet<Arc<str>>>,
     next_id: u64,
+    /// Markets changed since the last take, each with the shard it was on
+    /// before its first change.
+    pending: BTreeMap<Arc<str>, Option<ShardId>>,
+    /// Slots of markets that were on each shard at the last take and have
+    /// been removed since, reserved for their return until the next take.
+    freed: BTreeMap<ShardId, usize>,
+    /// Shards opened since the last take.
+    opened: BTreeSet<ShardId>,
+    /// Markets removed by an earlier take: the shard each was last on, and
+    /// when.
+    departed: HashMap<Arc<str>, (ShardId, Instant)>,
 }
 
-/// New markets placed on one shard.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct Placement {
-    /// The shard.
-    pub(super) shard: ShardId,
-    /// Whether the shard is new and has to be started.
-    pub(super) opens: bool,
-    /// The markets placed on it, in placement order.
-    pub(super) symbols: Vec<Arc<str>>,
+/// The net effect of the registry changes since the last take.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Changes {
+    /// New shards to start, each with its markets.
+    pub(super) opened: Vec<(ShardId, BTreeSet<Arc<str>>)>,
+    /// Running shards whose markets changed.
+    pub(super) updated: BTreeMap<ShardId, Update>,
+    /// Running shards with no markets left, to close.
+    pub(super) closed: Vec<ShardId>,
+    /// Markets no longer recorded.
+    pub(super) departed: Vec<Arc<str>>,
+    /// Markets recorded again after an earlier take reported them departed.
+    pub(super) returned: Vec<Arc<str>>,
 }
 
-/// What removing a market leaves its shard to do.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Removal {
-    /// Unsubscribe the market; the shard has others.
-    Unsubscribe(ShardId),
-    /// Close the shard; the market was its last.
-    Close(ShardId),
+/// One market's net move since the last take: the shard it was on before
+/// and the one it is on now.
+struct Move {
+    symbol: Arc<str>,
+    before: Option<ShardId>,
+    after: Option<ShardId>,
+}
+
+/// The change to one running shard's markets.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Update {
+    /// Markets to unsubscribe.
+    pub(super) removed: Vec<Arc<str>>,
+    /// Markets to subscribe.
+    pub(super) added: Vec<Arc<str>>,
 }
 
 impl Registry {
@@ -48,40 +114,70 @@ impl Registry {
             owners: HashMap::new(),
             shards: BTreeMap::new(),
             next_id: 0,
+            pending: BTreeMap::new(),
+            freed: BTreeMap::new(),
+            opened: BTreeSet::new(),
+            departed: HashMap::new(),
         }
     }
 
-    /// Places every market of `symbols` not already registered, and returns
-    /// the placements by shard, in shard order.
-    pub(super) fn place(&mut self, symbols: impl IntoIterator<Item = Arc<str>>) -> Vec<Placement> {
-        let mut placements: BTreeMap<ShardId, Placement> = BTreeMap::new();
-        for symbol in symbols {
-            if self.owners.contains_key(&symbol) {
-                continue;
-            }
-            let (shard, opens) = self.shard_with_room();
-            self.assign(symbol.clone(), shard);
-            let placement = placements.entry(shard).or_insert_with(|| Placement {
-                shard,
-                opens,
-                symbols: Vec::new(),
-            });
-            placement.symbols.push(symbol);
+    /// Places `symbol` on a shard; false if it was already registered.
+    pub(super) fn place(&mut self, symbol: &Arc<str>) -> bool {
+        if self.owners.contains_key(symbol) {
+            return false;
         }
-        placements.into_values().collect()
+        let shard = self.shard_for(symbol);
+        if self.reserved_shard(symbol) == Some(shard) {
+            self.change_freed(shard, -1);
+        }
+        self.note_pending(symbol, None);
+        self.owners.insert(symbol.clone(), shard);
+        self.shards.entry(shard).or_default().insert(symbol.clone());
+        true
     }
 
-    /// Unregisters `symbol`, saying what its shard must do; `None` if it was
-    /// not registered.
-    pub(super) fn remove(&mut self, symbol: &str) -> Option<Removal> {
-        let shard = self.owners.remove(symbol)?;
-        let symbols = self.shards.get_mut(&shard)?;
-        symbols.remove(symbol);
-        if !symbols.is_empty() {
-            return Some(Removal::Unsubscribe(shard));
+    /// Unregisters `symbol`; false if it was not registered.
+    pub(super) fn remove(&mut self, symbol: &Arc<str>) -> bool {
+        let Some(shard) = self.owners.remove(symbol) else {
+            return false;
+        };
+        self.note_pending(symbol, Some(shard));
+        if self.reserved_shard(symbol) == Some(shard) {
+            self.change_freed(shard, 1);
         }
-        self.shards.remove(&shard);
-        Some(Removal::Close(shard))
+        if let Some(symbols) = self.shards.get_mut(&shard) {
+            symbols.remove(symbol);
+        }
+        true
+    }
+
+    /// The net effect of every change since the last take, made at `now`,
+    /// which empty shards close, and starts collecting again.
+    pub(super) fn take_changes(&mut self, now: Instant) -> Changes {
+        let opened = std::mem::take(&mut self.opened);
+        self.freed.clear();
+        let mut changes = Changes::default();
+        for (symbol, before) in std::mem::take(&mut self.pending) {
+            let after = self.owners.get(&symbol).copied();
+            let moved = Move {
+                symbol,
+                before,
+                after,
+            };
+            self.diff_shards(&mut changes, &moved, &opened);
+            self.diff_recorded(&mut changes, moved, now);
+        }
+        self.drop_empty_shards(&mut changes, &opened);
+        changes.opened = self.symbols_of(&opened);
+        changes
+    }
+
+    /// Forgets the markets that departed longer ago than
+    /// [`FORGOTTEN_RETENTION`] plus the grace period, at `now`.
+    pub(super) fn expire_departed(&mut self, now: Instant) {
+        let retention = FORGOTTEN_RETENTION + DEPARTED_GRACE;
+        let current = |(_, at): &(ShardId, Instant)| now.duration_since(*at) <= retention;
+        self.departed.retain(|_, departure| current(departure));
     }
 
     /// The shard `symbol` is on, if it is registered.
@@ -99,17 +195,59 @@ impl Registry {
         self.owners.len()
     }
 
+    /// Remembers the shard `symbol` was on before its first change since
+    /// the last take.
+    fn note_pending(&mut self, symbol: &Arc<str>, before: Option<ShardId>) {
+        self.pending.entry(symbol.clone()).or_insert(before);
+    }
+
+    /// The shard whose freed slot is reserved for `symbol`: the one it was
+    /// on at the last take, if it has been removed from it since.
+    fn reserved_shard(&self, symbol: &str) -> Option<ShardId> {
+        self.pending.get(symbol).copied().flatten()
+    }
+
+    fn change_freed(&mut self, shard: ShardId, by: isize) {
+        let freed = self.freed.entry(shard).or_default();
+        *freed = freed.saturating_add_signed(by);
+    }
+
+    /// The shard for `symbol`: its reserved slot, else its last shard if
+    /// it departed at an earlier take and that shard has room, else the
+    /// roomiest shard.
+    fn shard_for(&mut self, symbol: &str) -> ShardId {
+        if let Some(shard) = self.reserved_shard(symbol) {
+            return shard;
+        }
+        let departed = self.departed.get(symbol).map(|(shard, _)| *shard);
+        match departed.filter(|&shard| self.has_room(shard)) {
+            Some(shard) => shard,
+            None => self.shard_with_room(),
+        }
+    }
+
+    /// The slots of `shard` taken, counting those reserved for markets
+    /// removed since the last take.
+    fn load(&self, shard: ShardId, symbols: &BTreeSet<Arc<str>>) -> usize {
+        symbols.len() + self.freed.get(&shard).copied().unwrap_or(0)
+    }
+
+    fn has_room(&self, shard: ShardId) -> bool {
+        let symbols = self.shards.get(&shard);
+        symbols.is_some_and(|symbols| self.load(shard, symbols) < self.shard_size)
+    }
+
     /// The shard with the most free slots, or a new one if every shard is
-    /// full; true if it is new.
-    fn shard_with_room(&mut self) -> (ShardId, bool) {
-        let roomiest = self
-            .shards
-            .iter()
-            .filter(|(_, symbols)| symbols.len() < self.shard_size)
-            .max_by_key(|(id, symbols)| (self.shard_size - symbols.len(), Reverse(**id)));
+    /// full.
+    fn shard_with_room(&mut self) -> ShardId {
+        let free = |(id, symbols): (&ShardId, &BTreeSet<Arc<str>>)| {
+            let load = self.load(*id, symbols);
+            (load < self.shard_size).then(|| (self.shard_size - load, Reverse(*id)))
+        };
+        let roomiest = self.shards.iter().filter_map(free).max();
         match roomiest {
-            Some((id, _)) => (*id, false),
-            None => (self.open(), true),
+            Some((_, Reverse(id))) => id,
+            None => self.open(),
         }
     }
 
@@ -117,124 +255,348 @@ impl Registry {
         let id = ShardId(self.next_id);
         self.next_id += 1;
         self.shards.insert(id, BTreeSet::new());
+        self.opened.insert(id);
         id
     }
 
-    fn assign(&mut self, symbol: Arc<str>, shard: ShardId) {
-        self.owners.insert(symbol.clone(), shard);
-        self.shards.entry(shard).or_default().insert(symbol);
+    /// Adds the subscription changes for one market's move. A shard opened
+    /// since the last take subscribes its markets when it starts, and a
+    /// shard left empty closes, so neither gets an update.
+    fn diff_shards(&self, changes: &mut Changes, moved: &Move, opened: &BTreeSet<ShardId>) {
+        if moved.before == moved.after {
+            return;
+        }
+        let has_markets = |shard| self.shards.get(&shard).is_some_and(|set| !set.is_empty());
+        if let Some(shard) = moved.before.filter(|&shard| has_markets(shard)) {
+            let update = changes.updated.entry(shard).or_default();
+            update.removed.push(moved.symbol.clone());
+        }
+        if let Some(shard) = moved.after.filter(|shard| !opened.contains(shard)) {
+            let update = changes.updated.entry(shard).or_default();
+            update.added.push(moved.symbol.clone());
+        }
+    }
+
+    /// Notes a market that stopped being recorded, or started again after
+    /// an earlier take reported it departed.
+    fn diff_recorded(&mut self, changes: &mut Changes, moved: Move, now: Instant) {
+        match (moved.before, moved.after) {
+            (Some(shard), None) => {
+                self.departed.insert(moved.symbol.clone(), (shard, now));
+                changes.departed.push(moved.symbol);
+            }
+            (None, Some(_)) if self.departed.remove(&moved.symbol).is_some() => {
+                changes.returned.push(moved.symbol);
+            }
+            _ => {}
+        }
+    }
+
+    /// Drops every empty shard, reporting those that were running as
+    /// closed.
+    fn drop_empty_shards(&mut self, changes: &mut Changes, opened: &BTreeSet<ShardId>) {
+        let empty: Vec<ShardId> = self
+            .shards
+            .iter()
+            .filter(|(_, symbols)| symbols.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        for shard in empty {
+            self.shards.remove(&shard);
+            if !opened.contains(&shard) {
+                changes.closed.push(shard);
+            }
+        }
+    }
+
+    /// The markets of each of `shards` that is still open.
+    fn symbols_of(&self, shards: &BTreeSet<ShardId>) -> Vec<(ShardId, BTreeSet<Arc<str>>)> {
+        let open = |id: &ShardId| Some((*id, self.shards.get(id)?.clone()));
+        shards.iter().filter_map(open).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::writer::Forgotten;
 
     fn symbols(names: &[&str]) -> Vec<Arc<str>> {
         names.iter().map(|&name| Arc::from(name)).collect()
     }
 
-    fn placement(shard: u64, opens: bool, names: &[&str]) -> Placement {
-        Placement {
-            shard: ShardId(shard),
-            opens,
-            symbols: symbols(names),
+    fn set(names: &[&str]) -> BTreeSet<Arc<str>> {
+        symbols(names).into_iter().collect()
+    }
+
+    fn place_all(registry: &mut Registry, names: &[&str]) {
+        for symbol in symbols(names) {
+            registry.place(&symbol);
         }
     }
 
+    fn remove(registry: &mut Registry, name: &str) -> bool {
+        registry.remove(&Arc::from(name))
+    }
+
+    fn take(registry: &mut Registry) -> Changes {
+        registry.take_changes(Instant::now())
+    }
+
+    /// A registry with `names` placed and their changes taken.
     fn registry_with(shard_size: usize, names: &[&str]) -> Registry {
         let mut registry = Registry::new(shard_size);
-        registry.place(symbols(names));
+        place_all(&mut registry, names);
+        take(&mut registry);
         registry
+    }
+
+    fn owners(registry: &Registry, names: &[&str]) -> Vec<Option<u64>> {
+        let owner = |name: &&str| registry.owner(name).map(|shard| shard.0);
+        names.iter().map(owner).collect()
+    }
+
+    fn update(removed: &[&str], added: &[&str]) -> Update {
+        Update {
+            removed: symbols(removed),
+            added: symbols(added),
+        }
     }
 
     #[test]
     fn markets_fill_each_shard_before_a_new_one_opens() {
+        let registry = registry_with(3, &["A", "B", "C", "D", "E", "F", "G"]);
+        let names = ["A", "B", "C", "D", "E", "F", "G"];
+        let expected = [0, 0, 0, 1, 1, 1, 2].map(Some);
+        assert_eq!(owners(&registry, &names), expected);
+    }
+
+    #[test]
+    fn new_shards_open_with_all_their_markets() {
         let mut registry = Registry::new(3);
-        let placements = registry.place(symbols(&["A", "B", "C", "D", "E", "F", "G"]));
+        place_all(&mut registry, &["A", "B", "C", "D"]);
         let expected = vec![
-            placement(0, true, &["A", "B", "C"]),
-            placement(1, true, &["D", "E", "F"]),
-            placement(2, true, &["G"]),
+            (ShardId(0), set(&["A", "B", "C"])),
+            (ShardId(1), set(&["D"])),
         ];
-        assert_eq!(placements, expected);
+        assert_eq!(take(&mut registry).opened, expected);
     }
 
     #[test]
     fn a_new_market_goes_to_the_shard_with_the_most_free_slots() {
         let mut registry = registry_with(3, &["A", "B", "C", "D", "E", "F"]);
-        registry.remove("A");
-        registry.remove("D");
-        registry.remove("E");
-        let placements = registry.place(symbols(&["X"]));
-        assert_eq!(placements, vec![placement(1, false, &["X"])]);
+        for name in ["A", "D", "E"] {
+            remove(&mut registry, name);
+        }
+        take(&mut registry);
+        place_all(&mut registry, &["X"]);
+        assert_eq!(registry.owner("X"), Some(ShardId(1)));
     }
 
     #[test]
     fn a_tie_goes_to_the_oldest_shard() {
         let mut registry = registry_with(3, &["A", "B", "C", "D", "E", "F"]);
-        registry.remove("A");
-        registry.remove("D");
-        let placements = registry.place(symbols(&["X"]));
-        assert_eq!(placements, vec![placement(0, false, &["X"])]);
+        remove(&mut registry, "A");
+        remove(&mut registry, "D");
+        take(&mut registry);
+        place_all(&mut registry, &["X"]);
+        assert_eq!(registry.owner("X"), Some(ShardId(0)));
     }
 
     #[test]
-    fn a_page_can_top_up_one_shard_and_open_another() {
-        let mut registry = registry_with(3, &["A", "B"]);
-        let placements = registry.place(symbols(&["C", "D"]));
-        let expected = vec![placement(0, false, &["C"]), placement(1, true, &["D"])];
-        assert_eq!(placements, expected);
+    fn a_returning_market_prefers_its_previous_shard() {
+        let mut registry = registry_with(3, &["A", "B", "C", "D"]);
+        remove(&mut registry, "A");
+        take(&mut registry);
+        place_all(&mut registry, &["A"]);
+        assert_eq!(registry.owner("A"), Some(ShardId(0)));
+    }
+
+    #[test]
+    fn a_returning_market_whose_previous_shard_is_full_goes_elsewhere() {
+        let mut registry = registry_with(2, &["A", "B", "C"]);
+        remove(&mut registry, "A");
+        take(&mut registry);
+        place_all(&mut registry, &["X", "A"]);
+        assert_eq!(owners(&registry, &["X", "A"]), [Some(0), Some(1)]);
     }
 
     #[test]
     fn a_registered_market_is_not_placed_again() {
         let mut registry = registry_with(3, &["A"]);
-        let placements = registry.place(symbols(&["A", "B", "B"]));
-        assert_eq!(
-            (placements, registry.market_count()),
-            (vec![placement(0, false, &["B"])], 2)
-        );
-    }
-
-    #[test]
-    fn removing_a_market_from_a_shard_with_others_unsubscribes_it() {
-        let mut registry = registry_with(3, &["A", "B"]);
-        assert_eq!(registry.remove("A"), Some(Removal::Unsubscribe(ShardId(0))));
-    }
-
-    #[test]
-    fn removing_the_last_market_of_a_shard_closes_it() {
-        let mut registry = registry_with(3, &["A", "B", "C", "D"]);
-        let removal = registry.remove("D");
-        assert_eq!(
-            (removal, registry.shard_count()),
-            (Some(Removal::Close(ShardId(1))), 1)
-        );
-    }
-
-    #[test]
-    fn a_closed_shards_id_is_not_reused() {
-        let mut registry = registry_with(1, &["A"]);
-        registry.remove("A");
-        assert_eq!(
-            registry.place(symbols(&["B"])),
-            vec![placement(1, true, &["B"])]
-        );
+        let placed = registry.place(&Arc::from("A"));
+        assert_eq!((placed, registry.market_count()), (false, 1));
     }
 
     #[test]
     fn removing_an_unknown_market_does_nothing() {
         let mut registry = registry_with(3, &["A"]);
-        assert_eq!((registry.remove("Z"), registry.market_count()), (None, 1));
+        let removed = remove(&mut registry, "Z");
+        let changes = take(&mut registry);
+        assert_eq!((removed, changes), (false, Changes::default()));
     }
 
     #[test]
-    fn the_owner_is_the_shard_a_market_was_placed_on() {
-        let registry = registry_with(2, &["A", "B", "C"]);
+    fn changes_to_a_running_shard_are_one_update() {
+        let mut registry = registry_with(4, &["A", "B"]);
+        remove(&mut registry, "A");
+        place_all(&mut registry, &["X", "Y"]);
+        let changes = take(&mut registry);
+        let expected = BTreeMap::from([(ShardId(0), update(&["A"], &["X", "Y"]))]);
+        assert_eq!(changes.updated, expected);
+    }
+
+    #[test]
+    fn a_removed_market_departs() {
+        let mut registry = registry_with(3, &["A", "B"]);
+        remove(&mut registry, "A");
+        assert_eq!(take(&mut registry).departed, symbols(&["A"]));
+    }
+
+    #[test]
+    fn a_market_removed_and_placed_again_before_a_take_changes_nothing() {
+        let mut registry = registry_with(3, &["A", "B"]);
+        remove(&mut registry, "A");
+        place_all(&mut registry, &["A"]);
+        assert_eq!(take(&mut registry), Changes::default());
+    }
+
+    #[test]
+    fn a_market_placed_after_departing_returns() {
+        let mut registry = registry_with(3, &["A", "B"]);
+        remove(&mut registry, "A");
+        take(&mut registry);
+        place_all(&mut registry, &["A"]);
+        let changes = take(&mut registry);
+        let expected = BTreeMap::from([(ShardId(0), update(&[], &["A"]))]);
         assert_eq!(
-            (registry.owner("C"), registry.owner("Z")),
-            (Some(ShardId(1)), None)
+            (changes.updated, changes.returned),
+            (expected, symbols(&["A"]))
         );
+    }
+
+    #[test]
+    fn removing_the_last_market_of_a_shard_closes_it_at_the_take() {
+        let mut registry = registry_with(3, &["A", "B", "C", "D"]);
+        remove(&mut registry, "D");
+        let changes = take(&mut registry);
+        let shards = registry.shard_count();
+        assert_eq!(
+            (changes.closed, changes.updated.len(), shards),
+            (vec![ShardId(1)], 0, 1)
+        );
+    }
+
+    #[test]
+    fn an_emptied_shard_takes_markets_until_the_take() {
+        let mut registry = registry_with(3, &["A", "B", "C", "D"]);
+        remove(&mut registry, "D");
+        place_all(&mut registry, &["D"]);
+        assert_eq!(take(&mut registry), Changes::default());
+    }
+
+    #[test]
+    fn a_closed_shards_id_is_not_reused() {
+        let mut registry = registry_with(1, &["A"]);
+        remove(&mut registry, "A");
+        take(&mut registry);
+        place_all(&mut registry, &["B"]);
+        assert_eq!(registry.owner("B"), Some(ShardId(1)));
+    }
+
+    /// X may not take A's freed slot, so A goes back to its own shard
+    /// rather than moving to another before the take.
+    #[test]
+    fn a_market_removed_and_placed_again_before_a_take_gets_its_slot_back() {
+        let mut registry = registry_with(2, &["A", "B", "C"]);
+        remove(&mut registry, "A");
+        place_all(&mut registry, &["X", "A"]);
+        assert_eq!(owners(&registry, &["X", "A"]), [Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn freed_slots_are_free_again_after_the_take() {
+        let mut registry = registry_with(2, &["A", "B", "C"]);
+        remove(&mut registry, "A");
+        take(&mut registry);
+        place_all(&mut registry, &["X"]);
+        assert_eq!(registry.owner("X"), Some(ShardId(0)));
+    }
+
+    /// The changes when A, which departed from a shard it shared with B,
+    /// is placed again after an expiry `after` its departure.
+    fn departed_then_expired(after: Duration) -> Changes {
+        let mut registry = registry_with(3, &["A", "B"]);
+        remove(&mut registry, "A");
+        let departed_at = Instant::now();
+        registry.take_changes(departed_at);
+        registry.expire_departed(departed_at + after);
+        place_all(&mut registry, &["A"]);
+        take(&mut registry)
+    }
+
+    #[test]
+    fn a_departed_market_returns_within_the_retention() {
+        let retention = FORGOTTEN_RETENTION + DEPARTED_GRACE;
+        let changes = departed_then_expired(retention);
+        assert_eq!(changes.returned, symbols(&["A"]));
+    }
+
+    /// When the writer's 250 ms snapshot ticks and the registry's 10 s
+    /// sweeps fall, as multiples of a 50 ms step after the departure.
+    struct Phases {
+        tick: u32,
+        sweep: u32,
+    }
+
+    /// Replays 16 minutes in 50 ms steps with the writer's real pruning,
+    /// 200 ms behind the registry: the registry must remember a departed
+    /// market for as long as the writer drops its events, and forget it in
+    /// the end.
+    fn replay_departure(phases: &Phases) {
+        let mut registry = registry_with(3, &["A", "B"]);
+        remove(&mut registry, "A");
+        let departed_at = Instant::now();
+        registry.take_changes(departed_at);
+        let mut writer = Forgotten::default();
+        writer.insert("A".into(), departed_at + Duration::from_millis(200));
+        let step = Duration::from_millis(50);
+        for n in 1..=16 * 60 * 20 {
+            let now = departed_at + step * n;
+            if n % 5 == phases.tick {
+                writer.prune(now);
+            }
+            if n % 200 == phases.sweep {
+                registry.expire_departed(now);
+            }
+            let remembered = registry.departed.contains_key("A");
+            assert!(remembered || !writer.contains("A"), "at {:?}", step * n);
+        }
+        assert!(!registry.departed.contains_key("A"));
+    }
+
+    #[test]
+    fn the_registry_remembers_a_departed_market_while_the_writer_drops_it() {
+        for tick in 0..5 {
+            for sweep in 0..5 {
+                replay_departure(&Phases { tick, sweep });
+            }
+        }
+    }
+
+    #[test]
+    fn a_departed_market_comes_back_as_new_after_the_retention() {
+        let retention = FORGOTTEN_RETENTION + DEPARTED_GRACE;
+        let changes = departed_then_expired(retention + Duration::from_secs(1));
+        assert_eq!(changes.returned, Vec::<Arc<str>>::new());
+    }
+
+    #[test]
+    fn a_shard_opened_and_emptied_before_a_take_is_never_started() {
+        let mut registry = registry_with(1, &["A"]);
+        place_all(&mut registry, &["B"]);
+        remove(&mut registry, "B");
+        let changes = take(&mut registry);
+        assert_eq!((changes, registry.shard_count()), (Changes::default(), 1));
     }
 }
