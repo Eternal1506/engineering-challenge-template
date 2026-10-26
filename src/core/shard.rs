@@ -244,6 +244,12 @@ impl Inputs {
         }
     }
 
+    /// Stops waiting for commands: the coordinator dropped the shard's
+    /// handle.
+    fn stop_commands(&mut self) {
+        self.commands = None;
+    }
+
     fn set_timer(&mut self, deadline: Option<Instant>) {
         if let Some(deadline) = deadline.filter(|&at| at != self.resync_timer.deadline()) {
             self.resync_timer.as_mut().reset(deadline);
@@ -305,7 +311,7 @@ impl Supervisor {
         match input {
             Input::Command(command) => self.apply(command),
             Input::Uncommanded => {
-                inputs.commands = None;
+                inputs.stop_commands();
                 self.connection.cancel.cancel();
             }
             Input::Event(event) => return self.handle(event).await,
