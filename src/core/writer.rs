@@ -1,15 +1,22 @@
 //! The writer thread: it owns every [`Book`] and the SBE output, turns feed
 //! events into `Snapshot` and `PriceLevelUpdate` messages, and snapshots every
 //! book once per cycle, with the books staggered across the cycle.
+//!
+//! Output times are stream times, never the wall clock. The writer's clock is
+//! the latest receive time of any event it has processed, and the snapshots
+//! it makes itself are stamped with it. Every message's receive time is also
+//! held to at least the previous one written for its symbol, so each symbol's
+//! times never go backwards, even when events from different connections
+//! arrive slightly out of order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Interval};
 
@@ -41,8 +48,13 @@ pub enum WriterMessage {
     /// Apply a feed event to its book and write it.
     Event(FeedEvent),
     /// Write a final snapshot of the symbol's book, then drop the book, for a
-    /// market that has stopped trading.
+    /// market that has stopped trading. Every later event for the symbol is
+    /// dropped until a [`Track`](Self::Track) for it.
     Forget(Arc<str>),
+    /// Accept events for a symbol again after a [`Forget`](Self::Forget),
+    /// for a market that has been registered again. Its book restarts from
+    /// its next snapshot.
+    Track(Arc<str>),
 }
 
 /// How to run the writer thread.
@@ -100,6 +112,8 @@ pub struct WriterStats {
     pub updates_written: u64,
     /// Level changes dropped because their symbol had no snapshot yet.
     pub dropped_before_snapshot: u64,
+    /// Events dropped because their symbol was forgotten.
+    pub dropped_forgotten: u64,
     /// Level changes that left their book inconsistent.
     pub inconsistent: u64,
     /// Resnapshot requests lost because the request channel was full or
@@ -161,25 +175,19 @@ fn run(
         .enable_time()
         .build()
         .context("building the writer runtime")?;
-    let timing = Timing {
-        snapshot_tick: config.snapshot_tick,
-        flush_interval: config.flush_interval,
-    };
     let writer = BookWriter::new(output, &config);
-    runtime.block_on(writer.run(receiver, timing))
-}
-
-/// The writer's timers.
-struct Timing {
-    snapshot_tick: Duration,
-    flush_interval: Option<Duration>,
+    runtime.block_on(writer.run(receiver, &config))
 }
 
 /// The state the writer thread owns.
 struct BookWriter {
     output: SbeOutput,
     books: HashMap<Arc<str>, TrackedBook>,
+    /// Symbols whose events are dropped until they are tracked again.
+    forgotten: HashSet<Arc<str>>,
     schedule: SnapshotSchedule,
+    /// The latest receive time of any event processed.
+    clock: DateTime<Utc>,
     resnapshot_requests: mpsc::Sender<Arc<str>>,
     stats: WriterStats,
 }
@@ -189,7 +197,29 @@ struct TrackedBook {
     book: Book,
     slot: usize,
     /// Whether a resnapshot has been requested since the last feed snapshot.
+    /// Unlike [`Book::needs_resnapshot`], it stays unset when the request
+    /// could not be sent, so the next inconsistent change asks again.
     resnapshot_requested: bool,
+    /// The receive time of the last message written for the symbol.
+    last_written_at: DateTime<Utc>,
+}
+
+impl TrackedBook {
+    fn new(slot: usize) -> Self {
+        Self {
+            book: Book::default(),
+            slot,
+            resnapshot_requested: false,
+            last_written_at: DateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// The receive time for the symbol's next message: `at`, or the previous
+    /// message's if that was later.
+    fn stamp(&mut self, at: DateTime<Utc>) -> DateTime<Utc> {
+        self.last_written_at = self.last_written_at.max(at);
+        self.last_written_at
+    }
 }
 
 impl BookWriter {
@@ -197,21 +227,24 @@ impl BookWriter {
         Self {
             output: SbeOutput::new(output),
             books: HashMap::new(),
+            forgotten: HashSet::new(),
             schedule: SnapshotSchedule::new(config.snapshot_slots),
+            clock: DateTime::UNIX_EPOCH,
             resnapshot_requests: config.resnapshot_requests.clone(),
             stats: WriterStats::default(),
         }
     }
 
     /// Handles messages and timer ticks until every sender is dropped and the
-    /// channel is drained, then flushes the output.
+    /// channel is drained, then flushes the output. The timers come from
+    /// `config`.
     async fn run(
         mut self,
         mut receiver: mpsc::Receiver<WriterMessage>,
-        timing: Timing,
+        config: &WriterConfig,
     ) -> anyhow::Result<WriterStats> {
-        let mut snapshot_timer = periodic(timing.snapshot_tick);
-        let mut flush_timer = timing.flush_interval.map(periodic);
+        let mut snapshot_timer = periodic(config.snapshot_tick);
+        let mut flush_timer = config.flush_interval.map(periodic);
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         loop {
             tokio::select! {
@@ -235,12 +268,21 @@ impl BookWriter {
     fn handle(&mut self, message: WriterMessage) -> anyhow::Result<()> {
         match message {
             WriterMessage::Event(event) => self.handle_event(&event),
-            WriterMessage::Forget(symbol) => self.forget(&symbol),
+            WriterMessage::Forget(symbol) => self.forget(symbol),
+            WriterMessage::Track(symbol) => {
+                self.forgotten.remove(&symbol);
+                Ok(())
+            }
         }
     }
 
     fn handle_event(&mut self, event: &FeedEvent) -> anyhow::Result<()> {
         self.stats.events += 1;
+        self.clock = self.clock.max(event.received_at);
+        if self.forgotten.contains(&event.symbol) {
+            self.stats.dropped_forgotten += 1;
+            return Ok(());
+        }
         match &event.body {
             FeedBody::Snapshot { bids, asks } => self.apply_snapshot(event, bids, asks),
             FeedBody::Level(change) => self.apply_level(event, *change),
@@ -258,35 +300,33 @@ impl BookWriter {
         let tracked = self
             .books
             .entry(event.symbol.clone())
-            .or_insert_with(|| TrackedBook {
-                book: Book::default(),
-                slot: self.schedule.add(event.symbol.clone()),
-                resnapshot_requested: false,
-            });
+            .or_insert_with(|| TrackedBook::new(self.schedule.add(event.symbol.clone())));
         let (bids, asks) = (bids.iter().copied(), asks.iter().copied());
         tracked.book.replace(bids, asks, event.exchange_ts);
         tracked.resnapshot_requested = false;
-        let snapshot = tracked.book.to_snapshot(&event.symbol, event.received_at);
+        let received_at = tracked.stamp(event.received_at);
+        let snapshot = tracked.book.to_snapshot(&event.symbol, received_at);
         self.output.write_snapshot(&snapshot)
     }
 
     /// Applies a level change and writes the level's absolute quantity, or
     /// drops the change if its symbol has no snapshot yet. The update's
-    /// exchange time is the event's, else the book's latest, else the
-    /// receive time.
+    /// exchange time is the book's latest, which never goes backwards, else
+    /// the receive time.
     fn apply_level(&mut self, event: &FeedEvent, change: LevelChange) -> anyhow::Result<()> {
         let Some(tracked) = self.books.get_mut(&event.symbol) else {
             self.drop_before_snapshot(&event.symbol);
             return Ok(());
         };
+        let backtest_timestamp = tracked.stamp(event.received_at);
         let applied = tracked.book.apply(change, event.exchange_ts);
-        let exchange_ts = event.exchange_ts.or(tracked.book.last_exchange_ts());
+        let exchange_ts = tracked.book.last_exchange_ts();
         if !applied.consistent {
             self.report_inconsistent(&event.symbol, change.price);
         }
         self.output.write_update(&PriceLevelUpdateDomain {
-            backtest_timestamp: event.received_at,
-            exchange_timestamp: exchange_ts.unwrap_or(event.received_at),
+            backtest_timestamp,
+            exchange_timestamp: exchange_ts.unwrap_or(backtest_timestamp),
             price_level: change.price,
             quantity: applied.quantity,
             side: change.side,
@@ -319,24 +359,29 @@ impl BookWriter {
         }
     }
 
-    /// Writes a final snapshot of the symbol's book and drops the book.
-    fn forget(&mut self, symbol: &Arc<str>) -> anyhow::Result<()> {
-        let Some(tracked) = self.books.remove(symbol) else {
-            tracing::debug!(%symbol, "asked to forget a symbol with no book");
+    /// Marks the symbol forgotten, and writes a final snapshot of its book,
+    /// if it has one, and drops the book.
+    fn forget(&mut self, symbol: Arc<str>) -> anyhow::Result<()> {
+        let Some(mut tracked) = self.books.remove(&symbol) else {
+            tracing::debug!(%symbol, "forgot a symbol with no book");
+            self.forgotten.insert(symbol);
             return Ok(());
         };
-        self.schedule.remove(symbol, tracked.slot);
-        self.output
-            .write_snapshot(&tracked.book.to_snapshot(symbol, Utc::now()))
+        self.schedule.remove(&symbol, tracked.slot);
+        let received_at = tracked.stamp(self.clock);
+        let snapshot = tracked.book.to_snapshot(&symbol, received_at);
+        self.forgotten.insert(symbol);
+        self.output.write_snapshot(&snapshot)
     }
 
-    /// Snapshots every book whose slot is due on this tick.
+    /// Snapshots every book whose slot is due on this tick, at the writer's
+    /// clock.
     fn write_due_snapshots(&mut self) -> anyhow::Result<()> {
-        let now = Utc::now();
         for symbol in self.schedule.next_due() {
-            if let Some(tracked) = self.books.get(symbol) {
+            if let Some(tracked) = self.books.get_mut(symbol) {
+                let received_at = tracked.stamp(self.clock);
                 self.output
-                    .write_snapshot(&tracked.book.to_snapshot(symbol, now))?;
+                    .write_snapshot(&tracked.book.to_snapshot(symbol, received_at))?;
             }
         }
         Ok(())

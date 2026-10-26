@@ -93,13 +93,28 @@ fn two_consecutive_runs_verify_clean_as_two_paths() -> anyhow::Result<()> {
 #[test]
 fn two_consecutive_runs_verify_clean_concatenated() -> anyhow::Result<()> {
     let (first, second) = (writer_recording(0)?, writer_recording(30_000)?);
-    let joined = NamedTempFile::new()?;
-    let mut output = joined.reopen()?;
-    output.write_all(&std::fs::read(first.path())?)?;
-    output.write_all(&std::fs::read(second.path())?)?;
-    let report = verify(&[&joined])?;
+    let report = verify(&[&concatenated(&[&first, &second])?])?;
     assert!(report.is_clean(), "{report}");
     assert_eq!((report.files, report.snapshots, report.updates), (1, 4, 6));
+    Ok(())
+}
+
+/// The bytes of `files` joined into one file, as `cat` would.
+fn concatenated(files: &[&NamedTempFile]) -> anyhow::Result<NamedTempFile> {
+    let joined = NamedTempFile::new()?;
+    let mut output = joined.reopen()?;
+    for file in files {
+        output.write_all(&std::fs::read(file.path())?)?;
+    }
+    Ok(joined)
+}
+
+#[test]
+fn a_restart_after_70_s_passes_as_two_paths_but_is_a_gap_concatenated() -> anyhow::Result<()> {
+    let (first, restarted) = (writer_recording(0)?, writer_recording(70_000)?);
+    assert!(verify(&[&first, &restarted])?.is_clean());
+    let report = verify(&[&concatenated(&[&first, &restarted])?])?;
+    assert_eq!(kinds(&report), [(ViolationKind::SnapshotGap, 2)]);
     Ok(())
 }
 
@@ -183,6 +198,25 @@ fn time_going_backwards_is_reported() -> anyhow::Result<()> {
 }
 
 #[test]
+fn the_report_counts_symbols_going_backwards_and_the_largest_step() -> anyhow::Result<()> {
+    let file = crafted(&[
+        snapshot("A", 10),
+        update("A", 5, 400_000, UNIT),
+        update("A", 4, 400_000, UNIT),
+        snapshot("B", 100),
+        update("B", 98, 400_000, UNIT),
+    ])?;
+    let report = verify(&[&file])?;
+    let count = report.count(ViolationKind::TimeWentBackwards);
+    let largest_step = report.largest_step_back.num_milliseconds();
+    let summary = (report.symbols_going_backwards, largest_step);
+    assert_eq!((count, summary), (3, (2, 6)));
+    let summary_line = "(2 symbols, largest step back 0.006 s)";
+    assert!(report.to_string().contains(summary_line), "{report}");
+    Ok(())
+}
+
+#[test]
 fn time_going_backwards_across_files_is_reported() -> anyhow::Result<()> {
     let first = crafted(&[snapshot("A", 100)])?;
     let second = crafted(&[snapshot("A", 50)])?;
@@ -202,20 +236,31 @@ fn a_negative_quantity_is_reported() -> anyhow::Result<()> {
 #[test]
 fn prices_outside_the_range_are_reported() -> anyhow::Result<()> {
     let bad_bid = snapshot_message("A", (0, 0), (&[(-1, UNIT)], &[]));
-    let file = crafted(&[bad_bid, update("A", 1, 1_000_001, UNIT)])?;
+    let file = crafted(&[
+        bad_bid,
+        update("A", 1, 1_000_001, UNIT),
+        update("A", 2, 0, UNIT),
+    ])?;
     let report = verify(&[&file])?;
-    assert_eq!(kinds(&report), [(ViolationKind::PriceOutOfRange, 2)]);
+    assert_eq!(kinds(&report), [(ViolationKind::PriceOutOfRange, 3)]);
     Ok(())
 }
 
 #[test]
-fn prices_at_both_ends_of_the_range_pass() -> anyhow::Result<()> {
+fn prices_just_inside_the_range_pass() -> anyhow::Result<()> {
     let file = crafted(&[
         snapshot("A", 0),
-        update("A", 1, 0, UNIT),
+        update("A", 1, 1, UNIT),
         update("A", 2, 1_000_000, UNIT),
     ])?;
     assert!(verify(&[&file])?.is_clean());
+    Ok(())
+}
+
+#[test]
+fn an_empty_recording_is_an_error() -> anyhow::Result<()> {
+    let empty = NamedTempFile::new()?;
+    assert!(verify(&[&empty]).is_err());
     Ok(())
 }
 

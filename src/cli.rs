@@ -53,7 +53,8 @@ pub struct RecordArgs {
     #[arg(long, value_name = "N", default_value = "1")]
     pub replicas: NonZeroUsize,
 
-    /// Flush the current output chunk at least this often, in seconds.
+    /// Flush the current output chunk at least this often, in seconds. Each
+    /// flush pads the output to a full 64 MiB chunk.
     #[arg(long, value_name = "SECS", value_parser = parse_seconds)]
     pub flush_interval: Option<Duration>,
 
