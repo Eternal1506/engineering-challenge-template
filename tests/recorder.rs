@@ -59,6 +59,7 @@ fn config(shard_size: usize) -> CoordinatorConfig {
             ..ConnectionConfig::default()
         },
         shard_event_capacity: 1024,
+        resync_timeout: Duration::from_secs(5),
         stats_interval: Duration::from_secs(3600),
         stall_timeout: Duration::from_secs(2),
         lifecycle: LifecycleTimings {
