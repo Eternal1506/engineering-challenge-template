@@ -130,9 +130,20 @@ impl Pipeline {
     }
 
     fn with_feed(feed: Feed<MockEndpoint, MockCodec>, config: CoordinatorConfig) -> Self {
+        Self::with_link(feed, config, |_| ()).0
+    }
+
+    /// A pipeline whose writer link `relink` adjusts before the coordinator
+    /// takes it, returned with what `relink` returns.
+    fn with_link<T>(
+        feed: Feed<MockEndpoint, MockCodec>,
+        config: CoordinatorConfig,
+        relink: impl FnOnce(&mut WriterLink) -> T,
+    ) -> (Self, T) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recording.sbe");
-        let (link, writer) = start_writer(&path, |_| {});
+        let (mut link, writer) = start_writer(&path, |_| {});
+        let relinked = relink(&mut link);
         let output = Output {
             progress: link.progress.clone(),
             writer,
@@ -140,10 +151,11 @@ impl Pipeline {
             _dir: dir,
         };
         let coordinator = Coordinator::new(feed, link, config);
-        Self {
+        let pipeline = Self {
             coordinator,
             output,
-        }
+        };
+        (pipeline, relinked)
     }
 }
 

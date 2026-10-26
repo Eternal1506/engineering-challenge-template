@@ -48,23 +48,11 @@ fn gated_pipeline(
     server: &MockServer,
     config: CoordinatorConfig,
 ) -> (Pipeline, watch::Sender<bool>) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("recording.sbe");
-    let (mut link, writer) = start_writer(&path, |_| {});
-    let (messages, gate) = gated_relay(link.messages);
-    link.messages = messages;
-    let output = Output {
-        progress: link.progress.clone(),
-        writer,
-        path,
-        _dir: dir,
-    };
-    let coordinator = Coordinator::new(mock_feed(server), link, config);
-    let pipeline = Pipeline {
-        coordinator,
-        output,
-    };
-    (pipeline, gate)
+    Pipeline::with_link(mock_feed(server), config, |link| {
+        let (messages, gate) = gated_relay(link.messages.clone());
+        link.messages = messages;
+        gate
+    })
 }
 
 /// Passes messages on to `writer` through a channel of one while the
@@ -226,7 +214,7 @@ async fn each_market_leaves_the_resync_on_its_own_snapshot() {
     assert_eq!(both, (resynced_then_raised(), resynced_then_raised()));
 }
 
-/// How long tests whose answers must beat the deadline give them.
+/// The deadline of tests in which something must happen before it.
 const GENEROUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long tests that let the deadline pass wait beyond it.
@@ -347,14 +335,15 @@ async fn a_new_socket_releases_the_held_markets_before_the_deadline() {
 
 /// The socket drops mid-resync and stays down past the deadline. That stops
 /// the resync clock, so nothing counts as overdue, and the new socket
-/// releases both markets.
+/// releases both markets. The generous deadline leaves the shard ample time
+/// to hear of the drop before it.
 #[tokio::test]
 async fn a_deadline_passing_while_the_socket_is_down_is_not_overdue() {
     let server = MockServer::start().await;
-    let (recorder, mut gapped) = recording_one_shard(&server, SHORT_TIMEOUT).await;
+    let (recorder, mut gapped) = recording_one_shard(&server, GENEROUS_TIMEOUT).await;
     open_gap(&mut gapped, "A").await;
     gapped.client.close().await;
-    tokio::time::sleep(SHORT_TIMEOUT + WELL_PAST).await;
+    tokio::time::sleep(GENEROUS_TIMEOUT + WELL_PAST).await;
     let mut reconnected = Shard::accept(&server, 2).await;
     reconnected.send_books().await;
     raise(&mut reconnected, "A").await;
