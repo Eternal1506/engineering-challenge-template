@@ -1,7 +1,8 @@
 use std::io::IsTerminal;
 
 use clap::Parser;
-use engineering_challenge::cli::{Cli, Command, SecretsArgs};
+use engineering_challenge::cli::{Cli, Command, SecretsArgs, VerifyArgs};
+use engineering_challenge::core::verify::{VerifyLimits, verify_files};
 use engineering_challenge::exchange::kalshi::KalshiCredentials;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -22,8 +23,25 @@ async fn main() -> anyhow::Result<()> {
             let credentials = load_credentials(&args.secrets)?;
             probe::run(&args, &credentials).await
         }
-        Command::Verify(_) => anyhow::bail!("verify is not implemented yet"),
+        Command::Verify(args) => verify(&args),
     }
+}
+
+/// Checks the recordings' invariants, prints the report to stderr, and fails
+/// if anything was violated.
+fn verify(args: &VerifyArgs) -> anyhow::Result<()> {
+    let limits = VerifyLimits {
+        max_snapshot_gap: args.max_snapshot_gap,
+        max_price: args.max_price,
+    };
+    let report = verify_files(&args.paths, &limits)?;
+    eprintln!("{report}");
+    anyhow::ensure!(
+        report.is_clean(),
+        "found {} violations",
+        report.violation_count()
+    );
+    Ok(())
 }
 
 fn load_credentials(secrets: &SecretsArgs) -> anyhow::Result<KalshiCredentials> {
