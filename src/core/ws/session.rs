@@ -13,6 +13,7 @@ use super::desired::Desired;
 use super::replies::{Answer, Replies};
 use super::sequence::SequenceCheck;
 use super::socket::{self, Socket};
+use super::traffic::TrafficWindow;
 use super::{Channels, CommandIds, ConnectionConfig, ConnectionEvent, Request};
 use crate::core::events::{Command, Decoded, FeedErrorKind, Inbound, SubId};
 use crate::exchange::FeedCodec;
@@ -57,6 +58,8 @@ pub(super) struct Session<'c, C> {
     silence: Pin<Box<Sleep>>,
     next_batch_at: Instant,
     decoded: Vec<Decoded>,
+    /// Recent traffic, logged if the exchange reports an overflow.
+    traffic: TrafficWindow,
 }
 
 type Step = Result<(), Stop>;
@@ -80,6 +83,7 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             silence: Box::pin(tokio::time::sleep_until(now + liveness)),
             next_batch_at: now,
             decoded: Vec::new(),
+            traffic: TrafficWindow::new(now),
         }
     }
 
@@ -280,10 +284,12 @@ impl<'c, C: FeedCodec> Session<'c, C> {
     }
 
     async fn on_text(&mut self, text: &str, received_at: DateTime<Utc>) -> Step {
+        let arrived = Instant::now();
+        self.traffic.note_frame(arrived, text.len());
         let mut decoded = std::mem::take(&mut self.decoded);
         decoded.clear();
         let result = match self.parts.codec.decode(text, received_at, &mut decoded) {
-            Ok(()) => self.deliver_all(&mut decoded).await,
+            Ok(()) => self.deliver_all(&mut decoded, arrived).await,
             Err(error) => {
                 log_undecodable(text, &error);
                 Ok(())
@@ -293,20 +299,25 @@ impl<'c, C: FeedCodec> Session<'c, C> {
         result
     }
 
-    async fn deliver_all(&mut self, decoded: &mut Vec<Decoded>) -> Step {
+    /// Delivers the messages of a frame that arrived at `arrived`.
+    async fn deliver_all(&mut self, decoded: &mut Vec<Decoded>, arrived: Instant) -> Step {
         for message in decoded.drain(..) {
-            self.deliver(message).await?;
+            self.deliver(message, arrived).await?;
         }
         Ok(())
     }
 
     /// Checks one message's sequence and replies, then forwards it, followed
-    /// by any rejection it carries.
-    async fn deliver(&mut self, decoded: Decoded) -> Step {
+    /// by any rejection it carries. Logs the recent traffic on an overflow.
+    async fn deliver(&mut self, decoded: Decoded, arrived: Instant) -> Step {
         self.check_sequence(&decoded).await?;
+        self.note_lag(&decoded.message, arrived);
         let Answer { tag, rejected } = self.track_reply(&decoded);
         self.note_subscription(&decoded.message).await?;
         let rejection = rejected.zip(error_kind(&decoded.message));
+        if is_overflow(&decoded.message) {
+            self.log_overflow();
+        }
         let loss = self.loss_reason(&decoded);
         self.emit(ConnectionEvent::Frame { decoded, tag }).await?;
         if let Some((symbols, kind)) = rejection {
@@ -323,14 +334,22 @@ impl<'c, C: FeedCodec> Session<'c, C> {
         }
     }
 
+    /// Samples the feed lag of a message, from a frame that arrived at
+    /// `arrived`, that says when the exchange made or sent it.
+    fn note_lag(&mut self, message: &Inbound, arrived: Instant) {
+        let Inbound::Feed(event) = message else {
+            return;
+        };
+        if let Some(exchange_ts) = event.exchange_ts {
+            let lag_ms = (event.received_at - exchange_ts).num_milliseconds();
+            self.traffic.note_lag(arrived, lag_ms);
+        }
+    }
+
     fn track_reply(&mut self, decoded: &Decoded) -> Answer {
-        match (decoded.reply_to, &decoded.message) {
-            (Some(id), message) => self.replies.on_reply(id, message),
-            (None, Inbound::Error { sub, kind }) => {
-                tracing::warn!(?sub, error = ?kind, "the exchange reported an error");
-                Answer::default()
-            }
-            (None, _) => Answer::default(),
+        match decoded.reply_to {
+            Some(id) => self.replies.on_reply(id, &decoded.message),
+            None => Answer::default(),
         }
     }
 
@@ -371,6 +390,20 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             .then(|| format!("the exchange rejected the first subscribe: {kind:?}"))
     }
 
+    /// Logs the event channel's depth and the socket's traffic over the last
+    /// ten seconds: frames and bytes per second and the median feed lag.
+    fn log_overflow(&self) {
+        let events = &self.parts.channels.events;
+        let traffic = self.traffic.summary(Instant::now());
+        tracing::warn!(
+            event_channel_depth = events.max_capacity() - events.capacity(),
+            frames_per_sec = traffic.frames_per_sec.round() as u64,
+            bytes_per_sec = traffic.bytes_per_sec.round() as u64,
+            median_lag_ms = traffic.median_lag_ms,
+            "overflow: the socket's last ten seconds"
+        );
+    }
+
     /// The silence timer fired: either the socket has been silent for the
     /// whole liveness timeout, or a frame came since and the timer moves on.
     fn on_silence(&mut self) -> Step {
@@ -407,6 +440,16 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             sent = channels.events.send(event) => sent.map_err(|_| Stop::Shutdown),
         }
     }
+}
+
+fn is_overflow(message: &Inbound) -> bool {
+    matches!(
+        message,
+        Inbound::Error {
+            kind: FeedErrorKind::Overflow,
+            ..
+        }
+    )
 }
 
 fn error_kind(message: &Inbound) -> Option<FeedErrorKind> {

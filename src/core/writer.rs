@@ -9,6 +9,8 @@
 //! symbol, so each symbol's times never go backwards, even when events from
 //! different connections arrive slightly out of order.
 
+mod progress;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +26,8 @@ use crate::core::book::Book;
 use crate::core::events::{FeedBody, FeedEvent, LevelChange};
 use crate::util::AlignedSbeWriter;
 use crate::util::dtos::challenge_orderbook::{PriceLevelUpdateDomain, SnapshotDomain};
+
+pub use progress::WriterProgress;
 
 /// The output chunk size. `AlignedSbeReader` reads 64 MiB chunks, so the
 /// writer must write the same size.
@@ -141,12 +145,18 @@ pub struct WriterStats {
 #[derive(Debug)]
 pub struct WriterHandle {
     thread: JoinHandle<anyhow::Result<WriterStats>>,
+    progress: Arc<WriterProgress>,
 }
 
 impl WriterHandle {
     /// Whether the thread has stopped, after finishing or failing.
     pub fn is_finished(&self) -> bool {
         self.thread.is_finished()
+    }
+
+    /// The thread's running counts of what it has written.
+    pub fn progress(&self) -> Arc<WriterProgress> {
+        self.progress.clone()
     }
 
     /// Waits for the thread to finish, which it does once every sender has
@@ -173,20 +183,24 @@ pub fn spawn_writer(
     let output = AlignedSbeWriter::create(&config.output, CHUNK_SIZE)
         .with_context(|| format!("creating {}", config.output.display()))?;
     let (sender, receiver) = mpsc::channel(config.channel_capacity);
+    let progress = Arc::new(WriterProgress::default());
+    let output = SbeOutput::new(output, progress.clone());
     let thread = std::thread::Builder::new()
         .name("writer".to_owned())
         .spawn(move || run(config, output, receiver))
         .context("spawning the writer thread")?;
-    Ok((sender, WriterHandle { thread }))
+    Ok((sender, WriterHandle { thread, progress }))
 }
 
 /// The writer thread's body: a single-threaded runtime driving the event
-/// loop, so timers need no busy-waiting.
+/// loop, so timers need no busy-waiting. It first marks itself as the
+/// writer thread, so stall checks can see it wake.
 fn run(
     config: WriterConfig,
-    output: AlignedSbeWriter,
+    output: SbeOutput,
     receiver: mpsc::Receiver<WriterMessage>,
 ) -> anyhow::Result<WriterStats> {
+    output.progress.attach_writer_thread();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -240,9 +254,9 @@ impl TrackedBook {
 }
 
 impl BookWriter {
-    fn new(output: AlignedSbeWriter, config: &WriterConfig) -> Self {
+    fn new(output: SbeOutput, config: &WriterConfig) -> Self {
         Self {
-            output: SbeOutput::new(output),
+            output,
             books: HashMap::new(),
             forgotten: HashSet::new(),
             schedule: SnapshotSchedule::new(config.snapshot_slots),
@@ -439,24 +453,19 @@ async fn next_tick(timer: &mut Option<Interval>) {
 /// The SBE output with counts of what was written to it.
 struct SbeOutput {
     writer: AlignedSbeWriter,
-    snapshots_written: u64,
-    updates_written: u64,
+    progress: Arc<WriterProgress>,
 }
 
 impl SbeOutput {
-    fn new(writer: AlignedSbeWriter) -> Self {
-        Self {
-            writer,
-            snapshots_written: 0,
-            updates_written: 0,
-        }
+    fn new(writer: AlignedSbeWriter, progress: Arc<WriterProgress>) -> Self {
+        Self { writer, progress }
     }
 
     fn write_snapshot(&mut self, snapshot: &SnapshotDomain) -> anyhow::Result<()> {
         self.writer
             .write_msg(snapshot)
             .with_context(|| format!("writing a snapshot of {}", snapshot.symbol))?;
-        self.snapshots_written += 1;
+        self.progress.note_snapshot();
         Ok(())
     }
 
@@ -464,7 +473,7 @@ impl SbeOutput {
         self.writer
             .write_msg(update)
             .with_context(|| format!("writing an update of {}", update.symbol))?;
-        self.updates_written += 1;
+        self.progress.note_update();
         Ok(())
     }
 
@@ -476,7 +485,8 @@ impl SbeOutput {
     /// counts.
     fn close(mut self) -> anyhow::Result<(u64, u64)> {
         self.flush()?;
-        Ok((self.snapshots_written, self.updates_written))
+        let progress = &self.progress;
+        Ok((progress.snapshots_written(), progress.updates_written()))
     }
 }
 

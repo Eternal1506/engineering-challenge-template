@@ -41,6 +41,7 @@ mod replies;
 mod sequence;
 mod session;
 mod socket;
+mod traffic;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
