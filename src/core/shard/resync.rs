@@ -5,6 +5,11 @@
 //! that arrives after the gap already includes whatever the gap lost. Each
 //! symbol leaves the resync on its own snapshot, whichever request it
 //! answers; the resync is complete once every symbol has.
+//!
+//! A symbol still waiting at the deadline may be a market the exchange has
+//! dropped, which never answers and never changes, so it is simply kept
+//! waiting. Only a change to it after the deadline shows it is live and
+//! still stale, and calls for a new socket.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -12,16 +17,27 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// The symbols of one shard still waiting for a snapshot, and the deadline
-/// for them.
+/// The symbols of one shard still waiting for a snapshot, and where the
+/// resync stands.
 #[derive(Debug)]
 pub(super) struct Resync {
     timeout: Duration,
     /// Symbols whose level changes are held back until their next snapshot.
     waiting: HashSet<Arc<str>>,
-    /// When to give up on the missing snapshots; `None` with no resync
-    /// running, or once it has given up.
-    deadline: Option<Instant>,
+    clock: Clock,
+}
+
+/// Where a resync stands against its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clock {
+    /// No deadline: no resync is running, or its socket went down.
+    Stopped,
+    /// Waiting for snapshots until the deadline.
+    Running(Instant),
+    /// The deadline passed with symbols still waiting.
+    Overdue,
+    /// A waiting symbol changed after the deadline; a new socket is due.
+    Replacing,
 }
 
 impl Resync {
@@ -30,7 +46,7 @@ impl Resync {
         Self {
             timeout,
             waiting: HashSet::new(),
-            deadline: None,
+            clock: Clock::Stopped,
         }
     }
 
@@ -38,39 +54,65 @@ impl Resync {
     /// restarting the deadline.
     pub(super) fn start(&mut self, symbols: &BTreeSet<Arc<str>>) {
         self.waiting = symbols.iter().cloned().collect();
-        let armed = !self.waiting.is_empty();
-        self.deadline = armed.then(|| Instant::now() + self.timeout);
+        self.clock = if self.waiting.is_empty() {
+            Clock::Stopped
+        } else {
+            Clock::Running(Instant::now() + self.timeout)
+        };
     }
 
     /// Whether `symbol`'s level changes are held back.
     pub(super) fn holds_back(&self, symbol: &str) -> bool {
-        !self.waiting.is_empty() && self.waiting.contains(symbol)
+        self.waiting.contains(symbol)
     }
 
     /// `symbol` needs no snapshot any more: one arrived, or the shard
     /// dropped it. True if that completed the resync before its deadline.
     pub(super) fn settle(&mut self, symbol: &str) -> bool {
-        let settled = !self.waiting.is_empty() && self.waiting.remove(symbol);
-        settled && self.waiting.is_empty() && self.deadline.take().is_some()
+        if !self.waiting.remove(symbol) || !self.waiting.is_empty() {
+            return false;
+        }
+        let in_time = matches!(self.clock, Clock::Running(_));
+        self.clock = Clock::Stopped;
+        in_time
     }
 
-    /// When the running resync gives up, if one is running.
+    /// When the running resync's deadline passes, while its clock runs.
     pub(super) fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        match self.clock {
+            Clock::Running(deadline) => Some(deadline),
+            _ => None,
+        }
     }
 
-    /// The deadline passed: stops the clock and returns how many symbols
-    /// are still waiting. They keep waiting until [`Resync::clear`].
+    /// The deadline passed: returns how many symbols are still waiting.
+    /// They keep waiting until their snapshot or a new socket.
     pub(super) fn expire(&mut self) -> usize {
-        self.deadline = None;
+        self.clock = Clock::Overdue;
         self.waiting.len()
+    }
+
+    /// A waiting symbol changed. True the first time that happens after the
+    /// deadline, when only a new socket will bring its snapshot.
+    pub(super) fn needs_new_socket(&mut self) -> bool {
+        let overdue = self.clock == Clock::Overdue;
+        if overdue {
+            self.clock = Clock::Replacing;
+        }
+        overdue
+    }
+
+    /// The socket went down: the deadline no longer applies, and the next
+    /// socket ends the resync.
+    pub(super) fn stop_clock(&mut self) {
+        self.clock = Clock::Stopped;
     }
 
     /// A new socket brings a fresh snapshot of every symbol before any of
     /// its level changes: ends the resync, returning how many symbols were
     /// still waiting.
     pub(super) fn clear(&mut self) -> usize {
-        self.deadline = None;
+        self.clock = Clock::Stopped;
         std::mem::take(&mut self.waiting).len()
     }
 }
@@ -122,6 +164,27 @@ mod tests {
         let held = resync.holds_back("A");
         let cleared = resync.clear();
         assert_eq!((held, cleared, resync.holds_back("A")), (true, 2, false));
+    }
+
+    #[test]
+    fn a_change_before_the_deadline_needs_no_new_socket() {
+        assert!(!resync_of(&["A"]).needs_new_socket());
+    }
+
+    #[test]
+    fn only_the_first_change_after_the_deadline_needs_a_new_socket() {
+        let mut resync = resync_of(&["A"]);
+        resync.expire();
+        let first = resync.needs_new_socket();
+        assert_eq!((first, resync.needs_new_socket()), (true, false));
+    }
+
+    #[test]
+    fn a_stopped_clock_keeps_symbols_waiting_without_a_deadline() {
+        let mut resync = resync_of(&["A"]);
+        resync.stop_clock();
+        let state = (resync.holds_back("A"), resync.deadline());
+        assert_eq!(state, (true, None));
     }
 
     #[test]

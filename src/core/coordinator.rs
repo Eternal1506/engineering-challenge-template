@@ -73,8 +73,8 @@ pub struct CoordinatorConfig {
     pub connection: ConnectionConfig,
     /// The capacity of the channel from each connection to its shard.
     pub shard_event_capacity: usize,
-    /// How long a shard waits for the snapshots a sequence gap asks for
-    /// before it reconnects instead.
+    /// How long a shard waits for the snapshots a sequence gap asks for.
+    /// After that, a change to a market still waiting reconnects the shard.
     pub resync_timeout: Duration,
     /// The time between two stats lines.
     pub stats_interval: Duration,

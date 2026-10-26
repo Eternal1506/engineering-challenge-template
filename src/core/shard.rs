@@ -13,11 +13,14 @@
 //! symbol's level changes are dropped, since they apply to a book that
 //! missed messages, until any snapshot of it arrives; that snapshot is
 //! forwarded and releases the symbol, independently of the others. Another
-//! gap restarts the resync. If symbols are still held back after
-//! [`ShardContext::resync_timeout`], the supervisor reconnects the
-//! connection, whose resubscribe brings a fresh snapshot of every symbol,
-//! and releases them all once it is back. Any new socket releases every
-//! symbol, for the same reason.
+//! gap restarts the resync.
+//!
+//! Symbols still held back after [`ShardContext::resync_timeout`] stay held:
+//! they may be markets the exchange dropped, which never answer and never
+//! change. The first change to one of them after the deadline shows it is
+//! live and still stale, so the supervisor reconnects the connection, whose
+//! resubscribe brings a fresh snapshot of every symbol. Any new socket
+//! releases every symbol, for the same reason.
 //!
 //! It also turns the coordinator's [`ShardCommand`]s into connection
 //! [`Request`]s.
@@ -26,12 +29,13 @@ mod resync;
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -46,8 +50,7 @@ use resync::Resync;
 /// supervisor.
 pub const DEFAULT_EVENT_CAPACITY: usize = 65_536;
 
-/// The default longest wait for the snapshots a sequence gap asks for,
-/// before the shard reconnects instead.
+/// The default longest wait for the snapshots a sequence gap asks for.
 pub const DEFAULT_RESYNC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A shard's identity, unique for the life of a coordinator.
@@ -76,8 +79,8 @@ pub struct ShardContext<E, C> {
     pub connection: ConnectionConfig,
     /// The capacity of the channel from a connection to its supervisor.
     pub event_capacity: usize,
-    /// How long a shard waits for the snapshots a sequence gap asks for
-    /// before it reconnects instead.
+    /// How long a shard waits for the snapshots a sequence gap asks for.
+    /// After that, a change to a market still waiting reconnects the shard.
     pub resync_timeout: Duration,
     /// The writer's input channel.
     pub writer: mpsc::Sender<WriterMessage>,
@@ -196,33 +199,55 @@ enum Input {
     ResyncDeadline,
 }
 
-/// Waits for the next command, passed `resync_deadline` or connection
-/// event, in that order of priority; `None` once the connection has ended.
-/// Without `commands`, waits for the other two only.
-async fn next_input(
-    events: &mut mpsc::Receiver<ConnectionEvent>,
-    commands: &mut Option<mpsc::UnboundedReceiver<ShardCommand>>,
-    resync_deadline: Option<Instant>,
-) -> Option<Input> {
-    let next_command = async {
-        match commands {
-            Some(commands) => commands.recv().await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        biased;
-        command = next_command => Some(command.map_or(Input::Uncommanded, Input::Command)),
-        () = passed(resync_deadline) => Some(Input::ResyncDeadline),
-        event = events.recv() => event.map(Input::Event),
-    }
+/// What a supervisor waits on.
+struct Inputs {
+    events: mpsc::Receiver<ConnectionEvent>,
+    /// The coordinator's commands, until it drops the shard's handle.
+    commands: Option<mpsc::UnboundedReceiver<ShardCommand>>,
+    /// Set to the running resync's deadline; polled only while one runs.
+    resync_timer: Pin<Box<Sleep>>,
 }
 
-/// Ends once `deadline` has passed; never without one.
-async fn passed(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
+impl Inputs {
+    fn new(
+        events: mpsc::Receiver<ConnectionEvent>,
+        commands: mpsc::UnboundedReceiver<ShardCommand>,
+    ) -> Self {
+        Self {
+            events,
+            commands: Some(commands),
+            resync_timer: Box::pin(tokio::time::sleep_until(Instant::now())),
+        }
+    }
+
+    /// Waits for the next command, passed `resync_deadline` or connection
+    /// event, in that order of priority; `None` once the connection has
+    /// ended.
+    async fn next(&mut self, resync_deadline: Option<Instant>) -> Option<Input> {
+        self.set_timer(resync_deadline);
+        let Self {
+            events,
+            commands,
+            resync_timer,
+        } = self;
+        let next_command = async {
+            match commands {
+                Some(commands) => commands.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            command = next_command => Some(command.map_or(Input::Uncommanded, Input::Command)),
+            () = resync_timer.as_mut(), if resync_deadline.is_some() => Some(Input::ResyncDeadline),
+            event = events.recv() => event.map(Input::Event),
+        }
+    }
+
+    fn set_timer(&mut self, deadline: Option<Instant>) {
+        if let Some(deadline) = deadline.filter(|&at| at != self.resync_timer.deadline()) {
+            self.resync_timer.as_mut().reset(deadline);
+        }
     }
 }
 
@@ -263,33 +288,28 @@ impl Supervisor {
     /// connection shuts down.
     async fn run(
         mut self,
-        mut events: mpsc::Receiver<ConnectionEvent>,
+        events: mpsc::Receiver<ConnectionEvent>,
         commands: mpsc::UnboundedReceiver<ShardCommand>,
     ) {
-        let mut commands = Some(commands);
-        while let Some(input) = next_input(&mut events, &mut commands, self.resync.deadline()).await
-        {
-            if self.on_input(input, &mut commands).await.is_break() {
+        let mut inputs = Inputs::new(events, commands);
+        while let Some(input) = inputs.next(self.resync.deadline()).await {
+            if self.on_input(input, &mut inputs).await.is_break() {
                 break;
             }
         }
-        drop(events);
+        drop(inputs);
         self.finish().await;
     }
 
-    async fn on_input(
-        &mut self,
-        input: Input,
-        commands: &mut Option<mpsc::UnboundedReceiver<ShardCommand>>,
-    ) -> ControlFlow<()> {
+    async fn on_input(&mut self, input: Input, inputs: &mut Inputs) -> ControlFlow<()> {
         match input {
             Input::Command(command) => self.apply(command),
             Input::Uncommanded => {
-                *commands = None;
+                inputs.commands = None;
                 self.connection.cancel.cancel();
             }
             Input::Event(event) => return self.handle(event).await,
-            Input::ResyncDeadline => self.on_resync_deadline(),
+            Input::ResyncDeadline => return self.on_resync_deadline(&mut inputs.events).await,
         }
         ControlFlow::Continue(())
     }
@@ -367,13 +387,26 @@ impl Supervisor {
     async fn on_feed(&mut self, event: FeedEvent) -> ControlFlow<()> {
         match event.body {
             FeedBody::Level(_) if self.resync.holds_back(&event.symbol) => {
-                self.counters.note_resync_drop();
+                self.drop_held_change(&event.symbol);
                 return ControlFlow::Continue(());
             }
             FeedBody::Snapshot { .. } => self.settle(&event.symbol),
             FeedBody::Level(_) => {}
         }
         self.forward(event).await
+    }
+
+    /// Drops a level change of `symbol`, which is held back. A change after
+    /// the deadline shows the market is live yet still unanswered, so the
+    /// first one reconnects: the new socket's subscribe snapshot is the
+    /// sure way to a fresh book.
+    fn drop_held_change(&mut self, symbol: &str) {
+        self.counters.note_resync_drop();
+        if self.resync.needs_new_socket() {
+            self.counters.note_resync_reconnect();
+            tracing::warn!(%symbol, "a market changed after the resync timed out, reconnecting");
+            self.request(Request::Reconnect);
+        }
     }
 
     /// `symbol` needs no snapshot any more; counts the resync complete if it
@@ -411,7 +444,6 @@ impl Supervisor {
     /// restarting any resync already running.
     fn on_gap(&mut self, sub: u64, expected: u64, got: u64) {
         self.counters.note_gap();
-        self.counters.note_resync_started();
         self.resync.start(&self.symbols);
         let tag = self.next_tag();
         let markets = self.symbols.len();
@@ -420,13 +452,35 @@ impl Supervisor {
         self.request(Request::RequestSnapshot { tag, symbols });
     }
 
-    /// Gives up on the missing snapshots and reconnects; the symbols stay
-    /// held back until the new socket is up.
-    fn on_resync_deadline(&mut self) {
+    /// Handles the events already queued when the deadline passed, since
+    /// any of them may settle, restart or stop the resync, then marks it
+    /// overdue if its deadline still stands.
+    async fn on_resync_deadline(
+        &mut self,
+        events: &mut mpsc::Receiver<ConnectionEvent>,
+    ) -> ControlFlow<()> {
+        for _ in 0..events.len() {
+            let Ok(event) = events.try_recv() else {
+                break;
+            };
+            if self.handle(event).await.is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        let deadline = self.resync.deadline();
+        if deadline.is_some_and(|at| at <= Instant::now()) {
+            self.mark_resync_overdue();
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Stops waiting on the clock. The unanswered symbols, which may be
+    /// markets the exchange dropped, stay held back until their snapshot,
+    /// a change that calls for a new socket, or a new socket.
+    fn mark_resync_overdue(&mut self) {
         let unanswered = self.resync.expire();
-        self.counters.note_resync_reconnect();
-        tracing::warn!(unanswered, "the resync timed out, reconnecting");
-        self.request(Request::Reconnect);
+        self.counters.note_resync_overdue();
+        tracing::warn!(unanswered, "the resync timed out, holding the rest");
     }
 
     /// A new socket's first message for each symbol is its subscribe
@@ -438,8 +492,11 @@ impl Supervisor {
         tracing::info!(released, "connected");
     }
 
+    /// The resync deadline no longer applies; the next socket releases every
+    /// symbol.
     fn on_disconnected(&mut self, reason: &str) {
         self.connected = false;
+        self.resync.stop_clock();
         self.counters.note_disconnected();
         tracing::info!(reason, "disconnected, reconnecting");
     }

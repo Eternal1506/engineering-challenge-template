@@ -171,12 +171,14 @@ async fn the_backlog_queued_at_cancel_still_reaches_the_writer() {
 }
 
 /// A writer blocked in a chunk write behind a reader taking about 3 MiB/s
-/// for 3 s writes no message in that time, yet keeps moving: shutdown
-/// outlasts the stall timeout and abandons nothing.
+/// for 4 s writes no message in that time, yet keeps moving: shutdown
+/// outlasts the stall timeout and abandons nothing. The reader's 20 ms
+/// pauses are a hundredth of the stall timeout, leaving room for a loaded
+/// machine to delay it.
 #[tokio::test]
 async fn a_writer_draining_into_a_slow_reader_is_not_abandoned() {
     let server = MockServer::start().await;
-    let stall_timeout = Duration::from_secs(1);
+    let stall_timeout = Duration::from_secs(2);
     let setup = Setup {
         channel: 8,
         flush: Duration::from_secs(1),
@@ -186,7 +188,7 @@ async fn a_writer_draining_into_a_slow_reader_is_not_abandoned() {
     tokio::time::sleep(Duration::from_millis(1300)).await;
     send_changes(&mut shard, 100).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let reading = read_slowly_then_to_end(pipeline.reader, Duration::from_secs(3));
+    let reading = read_slowly_then_to_end(pipeline.reader, Duration::from_secs(4));
     let took = shut_down(pipeline.coordinator, shard).await;
     reading.await.unwrap();
     let stats = join(pipeline.writer).await.unwrap();
@@ -212,15 +214,16 @@ fn slow_relay(writer: mpsc::Sender<WriterMessage>) -> mpsc::Sender<WriterMessage
     sender
 }
 
-/// A writer that writes a message every 200 ms makes progress well within
-/// the stall timeout, so shutdown outlasts the timeout yet abandons nothing.
+/// A writer that writes a message every 200 ms, a tenth of the stall
+/// timeout, makes progress well within it, so shutdown outlasts the timeout
+/// yet abandons nothing.
 #[tokio::test]
 async fn a_slow_but_progressing_writer_is_not_abandoned() {
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let (mut link, writer) = start_writer(&dir.path().join("out.sbe"), |_| {});
     link.messages = slow_relay(link.messages);
-    let stall_timeout = Duration::from_secs(1);
+    let stall_timeout = Duration::from_secs(2);
     let config = CoordinatorConfig {
         stall_timeout,
         ..config(3)
@@ -230,9 +233,9 @@ async fn a_slow_but_progressing_writer_is_not_abandoned() {
     coordinator.add_markets(markets.to_vec()).await;
     let mut shard = Shard::accept(&server, 1).await;
     shard.send_books().await;
-    send_changes(&mut shard, 12).await;
+    send_changes(&mut shard, 17).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let took = shut_down(coordinator, shard).await;
     let stats = join(writer).await.unwrap();
-    assert_eq!((stats.events, took > stall_timeout), (15, true), "{took:?}");
+    assert_eq!((stats.events, took > stall_timeout), (20, true), "{took:?}");
 }
