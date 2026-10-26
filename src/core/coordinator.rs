@@ -73,6 +73,9 @@ pub struct CoordinatorConfig {
     pub connection: ConnectionConfig,
     /// The capacity of the channel from each connection to its shard.
     pub shard_event_capacity: usize,
+    /// How long a shard waits for the snapshots a sequence gap asks for
+    /// before it reconnects instead.
+    pub resync_timeout: Duration,
     /// The time between two stats lines.
     pub stats_interval: Duration,
     /// How long shutdown waits for the shards to hand their last events to
@@ -91,6 +94,7 @@ impl Default for CoordinatorConfig {
             shard_size: DEFAULT_SHARD_SIZE,
             connection: ConnectionConfig::default(),
             shard_event_capacity: shard::DEFAULT_EVENT_CAPACITY,
+            resync_timeout: shard::DEFAULT_RESYNC_TIMEOUT,
             stats_interval: stats::DEFAULT_STATS_INTERVAL,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
             lifecycle: LifecycleTimings::default(),
@@ -505,6 +509,7 @@ fn shard_context<E, C>(
         codec: Arc::new(feed.codec),
         connection: config.connection.clone(),
         event_capacity: config.shard_event_capacity,
+        resync_timeout: config.resync_timeout,
         writer,
         counters: Arc::new(RecorderCounters::default()),
         cancel: CancellationToken::new(),

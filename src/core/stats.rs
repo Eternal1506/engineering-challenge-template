@@ -34,6 +34,9 @@ pub struct RecorderCounters {
     connections_up: AtomicUsize,
     disconnects: AtomicU64,
     gaps: AtomicU64,
+    resyncs_started: AtomicU64,
+    resyncs_completed: AtomicU64,
+    resync_reconnects: AtomicU64,
     resync_drops: AtomicU64,
     resnapshot_requests: AtomicU64,
     lifecycle_events: AtomicU64,
@@ -91,7 +94,14 @@ pub struct CounterValues {
     pub disconnects: u64,
     /// Sequence gaps seen.
     pub gaps: u64,
-    /// Level changes dropped while resyncing after a gap.
+    /// Resyncs started, one per gap. Each one completes, times out, is
+    /// restarted by another gap, or is ended by a new socket.
+    pub resyncs_started: u64,
+    /// Resyncs that got a snapshot of every symbol before their deadline.
+    pub resyncs_completed: u64,
+    /// Resyncs that timed out and reconnected.
+    pub resync_reconnects: u64,
+    /// Level changes dropped while their symbol was resyncing.
     pub resync_drops: u64,
     /// Fresh snapshots requested for inconsistent books.
     pub resnapshot_requests: u64,
@@ -132,7 +142,22 @@ impl RecorderCounters {
         self.gaps.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A level change was dropped while resyncing after a gap.
+    /// A gap started a resync.
+    pub fn note_resync_started(&self) {
+        self.resyncs_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A resync got a snapshot of every symbol in time.
+    pub fn note_resync_completed(&self) {
+        self.resyncs_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A resync timed out and reconnected.
+    pub fn note_resync_reconnect(&self) {
+        self.resync_reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A level change was dropped while its symbol was resyncing.
     pub fn note_resync_drop(&self) {
         self.resync_drops.fetch_add(1, Ordering::Relaxed);
     }
@@ -169,6 +194,9 @@ impl RecorderCounters {
             connections_up: self.connections_up.load(Ordering::Relaxed),
             disconnects: self.disconnects.load(Ordering::Relaxed),
             gaps: self.gaps.load(Ordering::Relaxed),
+            resyncs_started: self.resyncs_started.load(Ordering::Relaxed),
+            resyncs_completed: self.resyncs_completed.load(Ordering::Relaxed),
+            resync_reconnects: self.resync_reconnects.load(Ordering::Relaxed),
             resync_drops: self.resync_drops.load(Ordering::Relaxed),
             resnapshot_requests: self.resnapshot_requests.load(Ordering::Relaxed),
             lifecycle_events: self.lifecycle_events.load(Ordering::Relaxed),
@@ -197,10 +225,11 @@ pub struct Census {
 /// The line has the shard count, the markets recorded and known,
 /// connections up and down, events forwarded per second since the last
 /// line, snapshots and updates written, the writer channel's depth and its
-/// peak since startup, and the totals of resnapshot requests, gaps, resync
-/// drops, disconnects, lifecycle events, markets added and removed by each
-/// [`ChangeCause`], and reconciles. A sample above half the channel's
-/// capacity is logged at warn when the depth crosses that mark.
+/// peak since startup, and the totals of resnapshot requests, gaps, resyncs
+/// (completed, overdue, reconnect requested), resync drops, disconnects,
+/// lifecycle events, markets added and removed by each [`ChangeCause`], and
+/// reconciles. A sample above half the channel's capacity is logged at warn
+/// when the depth crosses that mark.
 #[derive(Debug)]
 pub struct StatsReporter {
     counters: Arc<RecorderCounters>,
@@ -275,6 +304,9 @@ impl StatsReporter {
             writer_peak = self.peak_depth,
             resnapshots = counts.resnapshot_requests,
             gaps = counts.gaps,
+            resyncs = counts.resyncs_started,
+            resyncs_completed = counts.resyncs_completed,
+            resync_reconnects = counts.resync_reconnects,
             resync_drops = counts.resync_drops,
             disconnects = counts.disconnects,
             lifecycle_events = counts.lifecycle_events,
