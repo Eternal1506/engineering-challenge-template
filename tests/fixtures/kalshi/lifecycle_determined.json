@@ -1,0 +1,13 @@
+{
+  "msg": {
+    "determination_ts": 1793028754,
+    "event_type": "determined",
+    "market_ticker": "KXITFMATCH-26OCT26BINESC-BIN",
+    "result": "no",
+    "settlement_value": "0.0000"
+  },
+  "sending_ts_ms": 1793028754870,
+  "seq": 50,
+  "sid": 1,
+  "type": "market_lifecycle_v2"
+}

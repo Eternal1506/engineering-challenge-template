@@ -3,8 +3,10 @@ use std::io::IsTerminal;
 use clap::Parser;
 use engineering_challenge::cli::{Cli, Command, SecretsArgs};
 use engineering_challenge::exchange::kalshi::KalshiCredentials;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::util::SubscriberInitExt;
+
+mod logging;
+mod probe;
 
 /// Parses the command line and runs the chosen subcommand. Logs go to stderr,
 /// because stdout carries the binary SBE output.
@@ -17,8 +19,8 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("record is not implemented yet")
         }
         Command::Probe(args) => {
-            load_credentials(&args.secrets)?;
-            anyhow::bail!("probe is not implemented yet")
+            let credentials = load_credentials(&args.secrets)?;
+            probe::run(&args, &credentials).await
         }
         Command::Verify(_) => anyhow::bail!("verify is not implemented yet"),
     }
@@ -33,12 +35,7 @@ fn load_credentials(secrets: &SecretsArgs) -> anyhow::Result<KalshiCredentials> 
 /// Sends `tracing` output to stderr, filtered by `RUST_LOG` (default `info`),
 /// with colour only when stderr is a terminal.
 fn init_logging() {
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    let ansi = std::io::stderr().is_terminal();
+    logging::subscriber(&rust_log, std::io::stderr, ansi).init();
 }

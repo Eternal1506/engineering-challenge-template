@@ -1,0 +1,15 @@
+{
+  "msg": {
+    "delta_fp": "-3.00",
+    "market_id": "01a17895-6ba0-7e23-b258-c47df4d3828a",
+    "market_ticker": "KXUNSEC-27JAN-VORB",
+    "price_dollars": "0.1700",
+    "side": "no",
+    "ts": "2026-10-26T15:31:45.693Z",
+    "ts_ms": 1793028705693
+  },
+  "sending_ts_ms": 1793028705697,
+  "seq": 3821,
+  "sid": 1,
+  "type": "orderbook_delta"
+}

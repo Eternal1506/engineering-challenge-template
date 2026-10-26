@@ -68,6 +68,14 @@ pub struct ProbeArgs {
     #[arg(long, value_name = "SECS", default_value = "300", value_parser = parse_seconds)]
     pub duration: Duration,
 
+    /// Number of open markets to subscribe on one connection.
+    #[arg(long, value_name = "N", default_value = "2000")]
+    pub tickers: NonZeroUsize,
+
+    /// Directory to save one raw frame of each kind seen, as test fixtures.
+    #[arg(long, value_name = "PATH")]
+    pub fixtures_dir: Option<PathBuf>,
+
     #[command(flatten)]
     pub secrets: SecretsArgs,
 }
@@ -158,15 +166,43 @@ mod tests {
         assert!(parse(&["record", "--flush-interval", "0"]).is_err());
     }
 
-    #[test]
-    fn probe_defaults_to_five_minutes() {
-        let expected = ProbeArgs {
+    fn default_probe_args() -> ProbeArgs {
+        ProbeArgs {
             duration: Duration::from_secs(300),
+            tickers: NonZeroUsize::new(2000).unwrap(),
+            fixtures_dir: None,
             secrets: SecretsArgs {
                 dir: PathBuf::from("secrets"),
             },
+        }
+    }
+
+    #[test]
+    fn probe_defaults_to_five_minutes_and_2000_tickers() {
+        assert_eq!(
+            parse(&["probe"]).unwrap(),
+            Command::Probe(default_probe_args())
+        );
+    }
+
+    #[test]
+    fn probe_takes_tickers_duration_and_fixtures_dir() {
+        let expected = ProbeArgs {
+            duration: Duration::from_secs(120),
+            tickers: NonZeroUsize::new(20_000).unwrap(),
+            fixtures_dir: Some(PathBuf::from("tests/fixtures/kalshi")),
+            ..default_probe_args()
         };
-        assert_eq!(parse(&["probe"]).unwrap(), Command::Probe(expected));
+        let args = [
+            "probe",
+            "--tickers",
+            "20000",
+            "--duration",
+            "120",
+            "--fixtures-dir",
+            "tests/fixtures/kalshi",
+        ];
+        assert_eq!(parse(&args).unwrap(), Command::Probe(expected));
     }
 
     #[test]

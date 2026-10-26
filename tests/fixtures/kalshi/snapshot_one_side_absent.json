@@ -1,0 +1,16 @@
+{
+  "msg": {
+    "market_id": "01a17894-191b-7145-87d3-b6ad5518cba5",
+    "market_ticker": "KXANTHVREQ-26OCT26-T9P3",
+    "no_dollars_fp": [
+      [
+        "0.0400",
+        "15.00"
+      ]
+    ]
+  },
+  "sending_ts_ms": 1793028702775,
+  "seq": 65,
+  "sid": 1,
+  "type": "orderbook_snapshot"
+}

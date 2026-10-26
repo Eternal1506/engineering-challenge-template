@@ -1,0 +1,11 @@
+{
+  "msg": {
+    "event_type": "deactivated",
+    "is_deactivated": true,
+    "market_ticker": "KXITFMATCH-26OCT26GARBEN-GAR"
+  },
+  "sending_ts_ms": 1793028937518,
+  "seq": 126,
+  "sid": 1,
+  "type": "market_lifecycle_v2"
+}

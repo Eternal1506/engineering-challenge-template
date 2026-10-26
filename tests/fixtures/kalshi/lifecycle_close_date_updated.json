@@ -1,0 +1,11 @@
+{
+  "msg": {
+    "close_ts": 1793028728,
+    "event_type": "close_date_updated",
+    "market_ticker": "KXATPGTOTAL-26OCT25FRITSI-20"
+  },
+  "sending_ts_ms": 1793028728766,
+  "seq": 8,
+  "sid": 1,
+  "type": "market_lifecycle_v2"
+}
