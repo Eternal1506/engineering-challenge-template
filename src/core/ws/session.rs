@@ -1,0 +1,428 @@
+//! [`Session`]: one socket's life, from the first subscribe to its loss or
+//! shutdown.
+
+use std::pin::Pin;
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
+use tokio::time::{Instant, Sleep};
+use tokio_tungstenite::tungstenite::{self, Message};
+
+use super::desired::Desired;
+use super::replies::{Answer, Replies};
+use super::sequence::SequenceCheck;
+use super::socket::{self, Socket};
+use super::{Channels, CommandIds, ConnectionConfig, ConnectionEvent, Request};
+use crate::core::events::{Command, Decoded, FeedErrorKind, Inbound, SubId};
+use crate::exchange::FeedCodec;
+
+/// The longest prefix of an undecodable frame that is logged.
+const FRAME_PREVIEW_CHARS: usize = 200;
+
+/// Why a session ended.
+#[derive(Debug)]
+pub(super) enum Stop {
+    /// The socket was lost or never opened; the connection should reconnect.
+    Lost(String),
+    /// The connection should close and return.
+    Shutdown,
+}
+
+/// What a session borrows from its connection.
+pub(super) struct Parts<'c, C> {
+    pub(super) codec: &'c C,
+    pub(super) config: &'c ConnectionConfig,
+    pub(super) desired: &'c mut Desired,
+    pub(super) ids: &'c mut CommandIds,
+    pub(super) channels: &'c mut Channels,
+}
+
+/// One open socket and the state that lasts only as long as it does.
+pub(super) struct Session<'c, C> {
+    parts: Parts<'c, C>,
+    socket: Socket,
+    /// The subscription the exchange named, once it has.
+    sub: Option<SubId>,
+    /// True while the opening subscribe batches are still going out.
+    batching: bool,
+    /// The id of the first subscribe sent on this socket.
+    opening_id: Option<u64>,
+    /// When the subscription must be named by, once a subscribe is out.
+    name_by: Instant,
+    sequence: SequenceCheck,
+    replies: Replies,
+    /// When the socket last delivered a message and the owner took it.
+    last_frame: Instant,
+    silence: Pin<Box<Sleep>>,
+    next_batch_at: Instant,
+    decoded: Vec<Decoded>,
+}
+
+type Step = Result<(), Stop>;
+
+impl<'c, C: FeedCodec> Session<'c, C> {
+    /// A session on a freshly opened `socket`, which has asked for nothing.
+    pub(super) fn new(parts: Parts<'c, C>, socket: Socket) -> Self {
+        parts.desired.forget_requests();
+        let now = Instant::now();
+        let liveness = parts.config.liveness_timeout;
+        Self {
+            batching: parts.desired.has_unrequested(),
+            replies: Replies::new(parts.config.reply_timeout),
+            parts,
+            socket,
+            sub: None,
+            opening_id: None,
+            name_by: now + liveness,
+            sequence: SequenceCheck::default(),
+            last_frame: now,
+            silence: Box::pin(tokio::time::sleep_until(now + liveness)),
+            next_batch_at: now,
+            decoded: Vec::new(),
+        }
+    }
+
+    /// Serves the socket until it is lost, reporting the loss to the owner
+    /// if the socket had connected, or until shutdown, closing it cleanly.
+    pub(super) async fn run(mut self) -> Stop {
+        match self.serve().await {
+            Stop::Shutdown => {
+                socket::close(&mut self.socket, self.parts.config.close_timeout).await;
+                Stop::Shutdown
+            }
+            Stop::Lost(reason) => self.report_lost(reason).await,
+        }
+    }
+
+    async fn serve(&mut self) -> Stop {
+        loop {
+            if let Err(stop) = self.step().await {
+                return stop;
+            }
+        }
+    }
+
+    /// Waits for and handles one thing: a shutdown, a request, a due
+    /// subscribe batch, a websocket message, or a timer running out.
+    async fn step(&mut self) -> Step {
+        let batch_due = self.batch_due();
+        let awaiting_name = self.sub.is_none() && self.opening_id.is_some();
+        tokio::select! {
+            biased;
+            () = self.parts.channels.cancel.cancelled() => Err(Stop::Shutdown),
+            () = self.parts.channels.events.closed() => Err(Stop::Shutdown),
+            request = self.parts.channels.requests.recv() => self.on_request(request).await,
+            () = tokio::time::sleep_until(self.next_batch_at), if batch_due => {
+                self.send_batch().await
+            }
+            message = self.socket.next() => self.on_message(message).await,
+            () = self.silence.as_mut() => self.on_silence(),
+            () = tokio::time::sleep_until(self.name_by), if awaiting_name => Err(Stop::Lost(
+                "the exchange did not name the subscription in time".to_owned(),
+            )),
+        }
+    }
+
+    /// Subscribe batches go out while the opening batches last, and again
+    /// for symbols added before the exchange names the subscription.
+    fn batch_due(&self) -> bool {
+        self.parts.desired.has_unrequested() && (self.batching || self.sub.is_none())
+    }
+
+    async fn on_request(&mut self, request: Option<Request>) -> Step {
+        match request.ok_or(Stop::Shutdown)? {
+            Request::Add(symbols) => self.parts.desired.add(symbols),
+            Request::Remove(symbols) => self.parts.desired.remove(&symbols),
+            Request::RequestSnapshot { tag, symbols } => {
+                return self.request_snapshot(tag, symbols).await;
+            }
+            Request::Reconnect => return self.reconnect(),
+        }
+        self.sync_changes().await
+    }
+
+    /// Ends a connected socket on request. A socket whose subscription is
+    /// not yet named is new already, and the naming deadline covers one
+    /// that never gets named.
+    fn reconnect(&self) -> Step {
+        if self.sub.is_none() {
+            tracing::debug!("ignored a reconnect request on a socket not yet connected");
+            return Ok(());
+        }
+        Err(Stop::Lost("requested".to_owned()))
+    }
+
+    async fn send_batch(&mut self) -> Step {
+        let config = self.parts.config;
+        let limit = config.subscribe_batch_size;
+        if let Some(batch) = self.parts.desired.next_subscribe(limit) {
+            let id = self.parts.ids.next();
+            self.note_opening(id);
+            self.send(batch.into_command(id)).await?;
+            self.next_batch_at = Instant::now() + config.subscribe_batch_interval;
+        }
+        self.sync_changes().await
+    }
+
+    /// Remembers the first subscribe, which must name the subscription
+    /// within the liveness timeout.
+    fn note_opening(&mut self, id: u64) {
+        if self.opening_id.is_none() {
+            self.opening_id = Some(id);
+            self.name_by = Instant::now() + self.parts.config.liveness_timeout;
+        }
+    }
+
+    /// Ends the opening batches once nothing is left to subscribe, then
+    /// sends the changes the subscription is behind on.
+    async fn sync_changes(&mut self) -> Step {
+        if !self.parts.desired.has_unrequested() {
+            self.batching = false;
+        }
+        self.send_changes().await
+    }
+
+    /// Sends the removes and adds the subscription is behind on, once the
+    /// opening batches are out and the exchange has named the subscription.
+    async fn send_changes(&mut self) -> Step {
+        let Some(sub) = self.sub.filter(|_| !self.batching) else {
+            return Ok(());
+        };
+        let remove = |id, symbols| Command::RemoveSymbols { id, sub, symbols };
+        let add = |id, symbols| Command::AddSymbols { id, sub, symbols };
+        let removed = self.parts.desired.take_removed();
+        self.send_update(removed, remove).await?;
+        let added = self.parts.desired.take_added();
+        self.send_update(added, add).await
+    }
+
+    /// Sends the command `build` makes for `symbols`, unless there are none.
+    async fn send_update(
+        &mut self,
+        symbols: Vec<Arc<str>>,
+        build: impl FnOnce(u64, Vec<Arc<str>>) -> Command,
+    ) -> Step {
+        if symbols.is_empty() {
+            return Ok(());
+        }
+        let id = self.parts.ids.next();
+        self.send(build(id, symbols)).await
+    }
+
+    async fn request_snapshot(&mut self, tag: u64, symbols: Vec<Arc<str>>) -> Step {
+        let symbols = self.parts.desired.asked_for(symbols);
+        let Some(sub) = self.sub.filter(|_| !symbols.is_empty()) else {
+            tracing::debug!(tag, "dropped a snapshot request with nothing to ask yet");
+            return Ok(());
+        };
+        let id = self.parts.ids.next();
+        let command = Command::RequestSnapshot { id, sub, symbols };
+        self.send_tagged(command, Some(tag)).await
+    }
+
+    async fn send(&mut self, command: Command) -> Step {
+        self.send_tagged(command, None).await
+    }
+
+    async fn send_tagged(&mut self, command: Command, tag: Option<u64>) -> Step {
+        let text = self.parts.codec.encode(&command);
+        self.replies.expect(&command, tag);
+        self.write(Message::text(text)).await
+    }
+
+    /// Writes `message`, giving up on shutdown, when the owner is gone, or
+    /// after the liveness timeout, so a socket that stopped draining cannot
+    /// stall the session.
+    async fn write(&mut self, message: Message) -> Step {
+        let limit = self.parts.config.liveness_timeout;
+        let write = tokio::time::timeout(limit, self.socket.send(message));
+        tokio::select! {
+            biased;
+            () = self.parts.channels.cancel.cancelled() => Err(Stop::Shutdown),
+            () = self.parts.channels.events.closed() => Err(Stop::Shutdown),
+            written = write => match written {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(Stop::Lost(format!("write error: {error}"))),
+                Err(_) => Err(Stop::Lost(format!("a write took over {limit:?}"))),
+            },
+        }
+    }
+
+    /// Handles one websocket message. The silence clock restarts only once
+    /// the owner has taken everything in it, so a slow owner never looks
+    /// like a silent socket.
+    async fn on_message(&mut self, message: Option<Result<Message, tungstenite::Error>>) -> Step {
+        let received_at = Utc::now();
+        let step = self.handle_message(message, received_at).await;
+        self.last_frame = Instant::now();
+        step
+    }
+
+    async fn handle_message(
+        &mut self,
+        message: Option<Result<Message, tungstenite::Error>>,
+        received_at: DateTime<Utc>,
+    ) -> Step {
+        match message {
+            Some(Ok(Message::Text(text))) => self.on_text(text.as_str(), received_at).await,
+            Some(Ok(Message::Binary(_))) => {
+                tracing::warn!("ignored a binary frame");
+                Ok(())
+            }
+            Some(Ok(Message::Close(frame))) => Err(Stop::Lost(format!(
+                "the server closed the socket: {frame:?}"
+            ))),
+            Some(Ok(_)) => Ok(()),
+            Some(Err(error)) => Err(Stop::Lost(format!("read error: {error}"))),
+            None => Err(Stop::Lost("the server ended the stream".to_owned())),
+        }
+    }
+
+    async fn on_text(&mut self, text: &str, received_at: DateTime<Utc>) -> Step {
+        let mut decoded = std::mem::take(&mut self.decoded);
+        decoded.clear();
+        let result = match self.parts.codec.decode(text, received_at, &mut decoded) {
+            Ok(()) => self.deliver_all(&mut decoded).await,
+            Err(error) => {
+                log_undecodable(text, &error);
+                Ok(())
+            }
+        };
+        self.decoded = decoded;
+        result
+    }
+
+    async fn deliver_all(&mut self, decoded: &mut Vec<Decoded>) -> Step {
+        for message in decoded.drain(..) {
+            self.deliver(message).await?;
+        }
+        Ok(())
+    }
+
+    /// Checks one message's sequence and replies, then forwards it, followed
+    /// by any rejection it carries.
+    async fn deliver(&mut self, decoded: Decoded) -> Step {
+        self.check_sequence(&decoded).await?;
+        let Answer { tag, rejected } = self.track_reply(&decoded);
+        self.note_subscription(&decoded.message).await?;
+        let rejection = rejected.zip(error_kind(&decoded.message));
+        let loss = self.loss_reason(&decoded);
+        self.emit(ConnectionEvent::Frame { decoded, tag }).await?;
+        if let Some((symbols, kind)) = rejection {
+            self.emit(ConnectionEvent::Rejected { symbols, kind })
+                .await?;
+        }
+        loss.map_or(Ok(()), |reason| Err(Stop::Lost(reason)))
+    }
+
+    async fn check_sequence(&mut self, decoded: &Decoded) -> Step {
+        match decoded.position.and_then(|at| self.sequence.observe(at)) {
+            Some(gap) => self.emit(gap).await,
+            None => Ok(()),
+        }
+    }
+
+    fn track_reply(&mut self, decoded: &Decoded) -> Answer {
+        match (decoded.reply_to, &decoded.message) {
+            (Some(id), message) => self.replies.on_reply(id, message),
+            (None, Inbound::Error { sub, kind }) => {
+                tracing::warn!(?sub, error = ?kind, "the exchange reported an error");
+                Answer::default()
+            }
+            (None, _) => Answer::default(),
+        }
+    }
+
+    /// The first subscribe reply names the subscription and makes the
+    /// socket connected.
+    async fn note_subscription(&mut self, message: &Inbound) -> Step {
+        let (Inbound::Subscribed { sub } | Inbound::Ack { sub, .. }) = message else {
+            return Ok(());
+        };
+        match self.sub {
+            None => self.name_subscription(*sub).await,
+            Some(named) if named != *sub => {
+                tracing::warn!(named = named.0, other = sub.0, "a reply named another sid");
+                Ok(())
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    async fn name_subscription(&mut self, sub: SubId) -> Step {
+        self.sub = Some(sub);
+        tracing::info!(sub = sub.0, "subscribed");
+        self.emit(ConnectionEvent::Connected).await?;
+        self.sync_changes().await
+    }
+
+    /// Why `decoded` ends the socket, if it does: an overflow, or an error
+    /// in reply to the first subscribe before the subscription is named.
+    fn loss_reason(&self, decoded: &Decoded) -> Option<String> {
+        let Inbound::Error { kind, .. } = &decoded.message else {
+            return None;
+        };
+        if *kind == FeedErrorKind::Overflow {
+            return Some("the exchange reported an overflow".to_owned());
+        }
+        let opening = decoded.reply_to.is_some() && decoded.reply_to == self.opening_id;
+        (opening && self.sub.is_none())
+            .then(|| format!("the exchange rejected the first subscribe: {kind:?}"))
+    }
+
+    /// The silence timer fired: either the socket has been silent for the
+    /// whole liveness timeout, or a frame came since and the timer moves on.
+    fn on_silence(&mut self) -> Step {
+        let timeout = self.parts.config.liveness_timeout;
+        let deadline = self.last_frame + timeout;
+        if deadline <= Instant::now() {
+            return Err(Stop::Lost(format!("no frame for {timeout:?}")));
+        }
+        self.silence.as_mut().reset(deadline);
+        Ok(())
+    }
+
+    async fn report_lost(&mut self, reason: String) -> Stop {
+        tracing::warn!(%reason, "lost the connection");
+        if self.sub.is_none() {
+            return Stop::Lost(reason);
+        }
+        let event = ConnectionEvent::Disconnected {
+            reason: reason.clone(),
+        };
+        match self.emit(event).await {
+            Ok(()) => Stop::Lost(reason),
+            Err(stop) => stop,
+        }
+    }
+
+    /// Sends `event` to the owner, waiting for room; fails if the owner is
+    /// gone or the connection is shutting down, dropping the event.
+    async fn emit(&mut self, event: ConnectionEvent) -> Step {
+        let channels = &*self.parts.channels;
+        tokio::select! {
+            biased;
+            () = channels.cancel.cancelled() => Err(Stop::Shutdown),
+            sent = channels.events.send(event) => sent.map_err(|_| Stop::Shutdown),
+        }
+    }
+}
+
+fn error_kind(message: &Inbound) -> Option<FeedErrorKind> {
+    match message {
+        Inbound::Error { kind, .. } => Some(kind.clone()),
+        _ => None,
+    }
+}
+
+/// Logs a frame the codec rejected: the error at warn, and the start of the
+/// frame, which can be large, only at debug.
+fn log_undecodable(text: &str, error: &anyhow::Error) {
+    tracing::warn!(error = %format_args!("{error:#}"), "dropped a frame that failed to decode");
+    let preview = text
+        .char_indices()
+        .nth(FRAME_PREVIEW_CHARS)
+        .map_or(text, |(end, _)| &text[..end]);
+    tracing::debug!(frame = preview, "the frame that failed to decode");
+}
