@@ -11,9 +11,15 @@ use tokio::time::Instant;
 use crate::core::shard::ShardId;
 use crate::core::writer::{DEFAULT_SNAPSHOT_TICK, FORGOTTEN_RETENTION};
 
-/// How far behind the registry the writer may be in processing a
-/// departed market's `Forget`: about a full writer channel, at the
-/// recorder's event rate.
+/// How much the writer's lag behind the registry may shrink between a
+/// departed market's `Forget` and the market's return. The writer starts
+/// the retention when it processes the `Forget`, and meets the returning
+/// market when it processes the new subscription's snapshot. Measured
+/// against the returning market's events, the writer's retention runs out
+/// later than the registry's by as much as its lag shrank in between. The
+/// shrink is at most the lag at the `Forget`: how long the writer takes to
+/// drain what is queued ahead of it, which depends on how fast it drains.
+/// 30 s is about a full writer channel at the expected event rate.
 const WRITER_LAG_ALLOWANCE: Duration = Duration::from_secs(30);
 
 /// The longest snapshot tick allowed for. The writer prunes the symbols it
@@ -21,13 +27,15 @@ const WRITER_LAG_ALLOWANCE: Duration = Duration::from_secs(30);
 const PRUNE_TICK_ALLOWANCE: Duration = Duration::from_secs(1);
 
 /// How long past [`FORGOTTEN_RETENTION`] the registry remembers a departed
-/// market. The writer starts the retention when it processes the market's
-/// `Forget`, up to [`WRITER_LAG_ALLOWANCE`] after the registry reported it
-/// departed, and drops the market up to a tick past the retention. The
-/// grace exceeds both together, so the registry keeps sending `Track` for a
-/// returning market for as long as the writer may still be dropping its
-/// events. A writer lagging even further is caught by the writer itself: a
-/// level change that finds no book asks for a fresh snapshot.
+/// market. Measured against the returning market's events, the writer's
+/// retention runs out later than the registry's by as much as its lag
+/// shrank between the market's `Forget` and its return, up to
+/// [`WRITER_LAG_ALLOWANCE`], and the writer drops the market up to a tick
+/// past the retention. The grace exceeds both together, so a market
+/// returning after the registry forgot it reaches a writer that has
+/// stopped dropping its events, and needs no `Track`. A lag shrinking even
+/// further is caught by the writer itself: a level change that finds no
+/// book asks for a fresh snapshot.
 const DEPARTED_GRACE: Duration = Duration::from_secs(60);
 
 const _: () = assert!(
@@ -54,7 +62,7 @@ const _: () = assert!(DEFAULT_SNAPSHOT_TICK.as_millis() <= PRUNE_TICK_ALLOWANCE.
 /// Departed markets are remembered for [`FORGOTTEN_RETENTION`] plus
 /// [`DEPARTED_GRACE`]. Once [`Registry::expire_departed`] drops one, it
 /// comes back as a new market, which the writer has stopped dropping by
-/// then unless it lagged by more than [`WRITER_LAG_ALLOWANCE`].
+/// then unless its lag shrank by more than [`WRITER_LAG_ALLOWANCE`].
 #[derive(Debug)]
 pub(super) struct Registry {
     shard_size: usize,
@@ -319,6 +327,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::coordinator::LifecycleTimings;
     use crate::core::writer::Forgotten;
 
     fn symbols(names: &[&str]) -> Vec<Arc<str>> {
@@ -542,44 +551,110 @@ mod tests {
         assert_eq!(changes.returned, symbols(&["A"]));
     }
 
-    /// When the writer's 250 ms snapshot ticks and the registry's 10 s
-    /// sweeps fall, as multiples of a 50 ms step after the departure.
-    struct Phases {
-        tick: u32,
-        sweep: u32,
+    /// The time step of a replayed departure.
+    const STEP: Duration = Duration::from_millis(50);
+
+    /// How many steps `period` spans.
+    fn steps(period: Duration) -> u32 {
+        u32::try_from(period.as_millis() / STEP.as_millis()).unwrap()
     }
 
-    /// Replays 16 minutes in 50 ms steps with the writer's real pruning,
-    /// 200 ms behind the registry: the registry must remember a departed
-    /// market for as long as the writer drops its events, and forget it in
-    /// the end.
-    fn replay_departure(phases: &Phases) {
-        let mut registry = registry_with(3, &["A", "B"]);
-        remove(&mut registry, "A");
-        let departed_at = Instant::now();
-        registry.take_changes(departed_at);
-        let mut writer = Forgotten::default();
-        writer.insert("A".into(), departed_at + Duration::from_millis(200));
-        let step = Duration::from_millis(50);
-        for n in 1..=16 * 60 * 20 {
-            let now = departed_at + step * n;
-            if n % 5 == phases.tick {
-                writer.prune(now);
-            }
-            if n % 200 == phases.sweep {
-                registry.expire_departed(now);
-            }
-            let remembered = registry.departed.contains_key("A");
-            assert!(remembered || !writer.contains("A"), "at {:?}", step * n);
+    /// A recurring timer, in steps after a departure.
+    #[derive(Clone, Copy)]
+    struct Timer {
+        period: u32,
+        phase: u32,
+    }
+
+    impl Timer {
+        /// A timer firing every `period` steps, `phase` steps into each.
+        fn new(period: u32, phase: u32) -> Self {
+            Self { period, phase }
         }
-        assert!(!registry.departed.contains_key("A"));
+
+        fn fires_at(self, step: u32) -> bool {
+            step % self.period == self.phase
+        }
     }
 
+    /// The writer's snapshot ticks, which prune what it has forgotten, and
+    /// the registry's sweeps, which expire departed markets.
+    struct Timers {
+        tick: Timer,
+        sweep: Timer,
+    }
+
+    /// Market A, departed from the registry, as the registry and the
+    /// writer each see it.
+    struct Departure {
+        registry: Registry,
+        writer: Forgotten,
+        at: Instant,
+    }
+
+    impl Departure {
+        /// A departs now, and the writer processes its `Forget` the whole
+        /// [`WRITER_LAG_ALLOWANCE`] later. A return then reaching the writer
+        /// at once is the most the lag can shrink.
+        fn new() -> Self {
+            let mut registry = registry_with(3, &["A", "B"]);
+            remove(&mut registry, "A");
+            let at = Instant::now();
+            registry.take_changes(at);
+            let mut writer = Forgotten::default();
+            writer.insert("A".into(), at + WRITER_LAG_ALLOWANCE);
+            Self {
+                registry,
+                writer,
+                at,
+            }
+        }
+
+        /// Runs whatever `timers` fire at `step`.
+        fn advance(&mut self, step: u32, timers: &Timers) {
+            let now = self.at + STEP * step;
+            if timers.tick.fires_at(step) {
+                self.writer.prune(now);
+            }
+            if timers.sweep.fires_at(step) {
+                self.registry.expire_departed(now);
+            }
+        }
+
+        /// Whether the registry remembers A, if the writer still drops it.
+        fn remembered_while_dropped(&self) -> bool {
+            self.registry.departed.contains_key("A") || !self.writer.contains("A")
+        }
+    }
+
+    /// Replays a departure in 50 ms steps, with the writer's real pruning,
+    /// until a couple of steps past the first sweep that may expire it: the
+    /// registry must remember the market for as long as the writer drops
+    /// its events, and forget it in the end.
+    fn replay_departure(timers: &Timers) {
+        let mut departure = Departure::new();
+        let last = steps(FORGOTTEN_RETENTION + DEPARTED_GRACE) + timers.sweep.period + 2;
+        let any_fires = |step: &u32| timers.tick.fires_at(*step) || timers.sweep.fires_at(*step);
+        for step in (1..=last).filter(any_fires) {
+            departure.advance(step, timers);
+            let at = STEP * step;
+            assert!(departure.remembered_while_dropped(), "at {at:?}");
+        }
+        assert!(!departure.registry.departed.contains_key("A"));
+    }
+
+    /// Replays the departure at every phase, in 50 ms steps, of the
+    /// writer's default ticks and the registry's default sweeps.
     #[test]
     fn the_registry_remembers_a_departed_market_while_the_writer_drops_it() {
-        for tick in 0..5 {
-            for sweep in 0..5 {
-                replay_departure(&Phases { tick, sweep });
+        let tick = steps(DEFAULT_SNAPSHOT_TICK);
+        let sweep = steps(LifecycleTimings::default().sweep_interval);
+        for tick_phase in 0..tick {
+            for sweep_phase in 0..sweep {
+                replay_departure(&Timers {
+                    tick: Timer::new(tick, tick_phase),
+                    sweep: Timer::new(sweep, sweep_phase),
+                });
             }
         }
     }

@@ -15,10 +15,10 @@ use tokio::time::Instant;
 /// symbol stays forgotten for at most this long plus one tick.
 ///
 /// The coordinator's registry remembers a departed market for this long
-/// plus a grace period longer than the writer's lag in processing the
-/// `Forget` and a tick, so it keeps sending
-/// [`Track`](super::WriterMessage::Track) for a returning market for as
-/// long as the writer could still be dropping its events.
+/// plus a grace period longer than a tick and the most the writer's lag
+/// may shrink between the `Forget` and the market's return, so it keeps
+/// sending [`Track`](super::WriterMessage::Track) for a returning market
+/// for as long as the writer could still be dropping its events.
 pub const FORGOTTEN_RETENTION: Duration = Duration::from_secs(600);
 
 /// Forgotten symbols, each with when it was forgotten.

@@ -159,6 +159,10 @@ async fn a_subscription_not_named_within_the_liveness_timeout_reconnects() {
     assert!(waited >= Duration::from_millis(250), "{waited:?}");
 }
 
+/// Building and starting the 40 MB write takes a debug build over a second
+/// before the write's timeout can run out, and several seconds under load,
+/// so the reconnect gets far more than the usual step timeout. A write
+/// that never times out still never reconnects.
 #[tokio::test]
 async fn a_write_the_server_never_drains_reconnects() {
     let server = MockServer::start().await;
@@ -166,7 +170,7 @@ async fn a_write_the_server_never_drains_reconnects() {
     let _running = setup.start(&server);
     let _stalled = server.accept().await;
     let started = Instant::now();
-    let _second = server.accept().await;
+    let _second = server.accept_within(Duration::from_secs(30)).await;
     let waited = started.elapsed();
     assert!(waited >= Duration::from_millis(250), "{waited:?}");
 }
@@ -211,14 +215,17 @@ async fn thirty_seconds_of_silence_reconnects_with_time_paused() {
     );
 }
 
+/// Pings 100 ms apart keep the connection up for twice its liveness
+/// timeout. The timeout is long enough that a stall of the test's thread
+/// under load does not open a real silence between two pings.
 #[tokio::test]
 async fn pings_keep_a_quiet_connection_alive() {
     let server = MockServer::start().await;
-    let setup = Setup::new(books(&["A"])).config(liveness(500));
+    let setup = Setup::new(books(&["A"])).config(liveness(1500));
     let mut running = setup.start(&server);
     let mut client = server.accept().await;
     subscribe(&mut client, &mut running, 1).await;
-    for _ in 0..15 {
+    for _ in 0..30 {
         client.ping().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

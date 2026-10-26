@@ -9,6 +9,7 @@
 //! symbol, so each symbol's times never go backwards, even when events from
 //! different connections arrive slightly out of order.
 
+mod bookless;
 mod forgotten;
 mod progress;
 
@@ -21,8 +22,9 @@ use std::time::Duration;
 use anyhow::Context;
 use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, Interval};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 
+use self::bookless::BooklessRequests;
 use crate::core::book::Book;
 use crate::core::events::{FeedBody, FeedEvent, LevelChange};
 use crate::util::AlignedSbeWriter;
@@ -61,10 +63,6 @@ pub const STAMP_MARGIN: TimeDelta = TimeDelta::seconds(1);
 /// The most messages the writer takes from its channel at once.
 const BATCH_SIZE: usize = 1024;
 
-/// How long after asking for a snapshot of a symbol whose level change
-/// found no book the writer waits before asking again.
-const BOOKLESS_RESNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
-
 /// What the writer thread is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterMessage {
@@ -97,8 +95,9 @@ pub struct WriterConfig {
     /// How many ticks one snapshot cycle has. Each book is snapshotted once
     /// per cycle, on its own slot.
     pub snapshot_slots: usize,
-    /// Flush the current chunk at least this often, if set. Each flush pads
-    /// the chunk to its full size.
+    /// Flush the current chunk this often, if set; a flush that comes late
+    /// is followed by the next a full interval later. Each flush pads the
+    /// chunk to its full size.
     pub flush_interval: Option<Duration>,
     /// Where to send the symbol of a book that a level change left
     /// inconsistent, so that a fresh snapshot can be requested for it.
@@ -226,9 +225,9 @@ struct BookWriter {
     /// Symbols whose events are dropped until they are tracked again or
     /// their retention runs out.
     forgotten: Forgotten,
-    /// Symbols without a book whose level changes asked for a snapshot,
-    /// and when.
-    bookless: HashMap<Arc<str>, Instant>,
+    /// Symbols without a book, and when their level changes last tried to
+    /// ask for a snapshot.
+    bookless: BooklessRequests,
     schedule: SnapshotSchedule,
     /// The latest receive time of any event processed.
     clock: DateTime<Utc>,
@@ -273,7 +272,7 @@ impl BookWriter {
             output,
             books: HashMap::new(),
             forgotten: Forgotten::default(),
-            bookless: HashMap::new(),
+            bookless: BooklessRequests::default(),
             schedule: SnapshotSchedule::new(config.snapshot_slots),
             clock: DateTime::UNIX_EPOCH,
             resnapshot_requests: config.resnapshot_requests.clone(),
@@ -289,8 +288,8 @@ impl BookWriter {
         mut receiver: mpsc::Receiver<WriterMessage>,
         config: &WriterConfig,
     ) -> anyhow::Result<WriterStats> {
-        let mut snapshot_timer = periodic(config.snapshot_tick);
-        let mut flush_timer = config.flush_interval.map(periodic);
+        let mut snapshot_timer = snapshot_timer(config.snapshot_tick);
+        let mut flush_timer = config.flush_interval.map(flush_timer);
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         loop {
             tokio::select! {
@@ -300,14 +299,20 @@ impl BookWriter {
                     }
                     self.handle_batch(&mut batch)?;
                 }
-                _ = snapshot_timer.tick() => {
-                    self.forgotten.prune(Instant::now());
-                    self.write_due_snapshots()?;
-                }
+                _ = snapshot_timer.tick() => self.on_snapshot_tick()?,
                 _ = next_tick(&mut flush_timer) => self.output.flush()?,
             }
         }
         self.finish()
+    }
+
+    /// Prunes the symbols forgotten and asked for long enough ago, and
+    /// writes the snapshots due on this tick.
+    fn on_snapshot_tick(&mut self) -> anyhow::Result<()> {
+        let now = Instant::now();
+        self.forgotten.prune(now);
+        self.bookless.prune(now);
+        self.write_due_snapshots()
     }
 
     fn handle_batch(&mut self, batch: &mut Vec<WriterMessage>) -> anyhow::Result<()> {
@@ -365,7 +370,7 @@ impl BookWriter {
     /// the receive time.
     fn apply_level(&mut self, event: &FeedEvent, change: LevelChange) -> anyhow::Result<()> {
         let Some(tracked) = self.books.get_mut(&event.symbol) else {
-            self.drop_before_snapshot(&event.symbol);
+            self.on_bookless_level(&event.symbol);
             return Ok(());
         };
         let backtest_timestamp = tracked.advance_to(event.received_at);
@@ -384,23 +389,27 @@ impl BookWriter {
         })
     }
 
-    /// Counts a level change for a symbol with no book, and asks for a
-    /// snapshot of the symbol, at most once per
-    /// [`BOOKLESS_RESNAPSHOT_INTERVAL`]. The book may never have started
-    /// because the snapshot that would start it was lost, so without a new
-    /// one the symbol would stay unrecorded.
-    fn drop_before_snapshot(&mut self, symbol: &Arc<str>) {
+    /// Counts a level change for a symbol with no book, and tries to ask
+    /// for a snapshot of the symbol, at most once per
+    /// [`BOOKLESS_RESNAPSHOT_INTERVAL`](bookless::BOOKLESS_RESNAPSHOT_INTERVAL).
+    /// The book may never have started because the snapshot that would
+    /// start it was lost, so without a new one the symbol would stay
+    /// unrecorded.
+    ///
+    /// A request lost to a full channel also waits out the interval: the
+    /// coordinator is behind then, and retrying on every level change would
+    /// add to its backlog and log a warning each time.
+    fn on_bookless_level(&mut self, symbol: &Arc<str>) {
         self.stats.dropped_before_snapshot += 1;
         tracing::debug!(%symbol, "dropped a level change before the first snapshot");
         let now = Instant::now();
-        let asked_at = self.bookless.get(symbol);
-        if asked_at.is_some_and(|at| now.duration_since(*at) < BOOKLESS_RESNAPSHOT_INTERVAL) {
+        if !self.bookless.should_ask(symbol, now) {
             return;
         }
-        if self.request_resnapshot(symbol) {
+        self.bookless.note_asked(symbol.clone(), now);
+        if request_resnapshot(&self.resnapshot_requests, &mut self.stats, symbol) {
             tracing::info!(%symbol, "asked for a snapshot of a symbol with no book");
             self.stats.bookless_resnapshot_requests += 1;
-            self.bookless.insert(symbol.clone(), now);
         }
     }
 
@@ -409,25 +418,13 @@ impl BookWriter {
     fn report_inconsistent(&mut self, symbol: &Arc<str>, price: i64) {
         self.stats.inconsistent += 1;
         tracing::warn!(%symbol, price, "level change left the book inconsistent");
-        let tracked = self.books.get(symbol);
-        let pending = tracked.map(|tracked| tracked.resnapshot_requested);
-        if pending != Some(false) || !self.request_resnapshot(symbol) {
+        let Some(tracked) = self.books.get_mut(symbol) else {
             return;
-        }
-        if let Some(tracked) = self.books.get_mut(symbol) {
-            tracked.resnapshot_requested = true;
-        }
-    }
-
-    /// Asks the coordinator for a fresh snapshot of `symbol`; false, counted
-    /// and logged, if the request channel is full or closed.
-    fn request_resnapshot(&mut self, symbol: &Arc<str>) -> bool {
-        let Err(error) = self.resnapshot_requests.try_send(symbol.clone()) else {
-            return true;
         };
-        self.stats.resnapshot_requests_dropped += 1;
-        tracing::warn!(%symbol, %error, "dropped a resnapshot request");
-        false
+        if !tracked.resnapshot_requested {
+            let requests = &self.resnapshot_requests;
+            tracked.resnapshot_requested = request_resnapshot(requests, &mut self.stats, symbol);
+        }
     }
 
     /// Marks the symbol forgotten, and writes a final snapshot of its book,
@@ -475,9 +472,44 @@ impl BookWriter {
     }
 }
 
-/// An interval whose first tick is one period from now.
-fn periodic(period: Duration) -> Interval {
-    tokio::time::interval_at(Instant::now() + period, period)
+/// Asks the coordinator, through `requests`, for a fresh snapshot of
+/// `symbol`; false, counted in `stats` and logged, if the request channel
+/// is full or closed.
+fn request_resnapshot(
+    requests: &mpsc::Sender<Arc<str>>,
+    stats: &mut WriterStats,
+    symbol: &Arc<str>,
+) -> bool {
+    let Err(error) = requests.try_send(symbol.clone()) else {
+        return true;
+    };
+    stats.resnapshot_requests_dropped += 1;
+    tracing::warn!(%symbol, %error, "dropped a resnapshot request");
+    false
+}
+
+/// The snapshot tick timer. Ticks missed while the writer was busy all
+/// fire at once when it catches up, so the cycle keeps its length in real
+/// time: each tick walks one slot, and a dropped or delayed tick would put
+/// every later slot's snapshots off by a tick.
+fn snapshot_timer(period: Duration) -> Interval {
+    periodic(period, MissedTickBehavior::Burst)
+}
+
+/// The periodic flush timer. A flush that comes late is followed by the
+/// next a full period later, not at once: with a slow output, catching up
+/// on missed ticks would flush padded chunks back to back, with only a few
+/// messages taken between them.
+fn flush_timer(period: Duration) -> Interval {
+    periodic(period, MissedTickBehavior::Delay)
+}
+
+/// An interval whose first tick is one period from now, and which handles
+/// missed ticks as `missed` says.
+fn periodic(period: Duration, missed: MissedTickBehavior) -> Interval {
+    let mut timer = tokio::time::interval_at(Instant::now() + period, period);
+    timer.set_missed_tick_behavior(missed);
+    timer
 }
 
 /// The next tick of `timer`, or never if there is no timer.
@@ -637,6 +669,36 @@ mod tests {
         let margin = STAMP_MARGIN.to_std().unwrap_or(Duration::MAX);
         let widest_gap = cycle.saturating_add(margin) + DEFAULT_SNAPSHOT_TICK;
         assert!(widest_gap <= DEFAULT_MAX_SNAPSHOT_GAP, "{widest_gap:?}");
+    }
+
+    const PERIOD: Duration = Duration::from_secs(1);
+
+    /// Moves the paused clock three and a half periods on without polling
+    /// the timer, so the timer misses three ticks, as it does while the
+    /// writer is busy.
+    async fn stall() {
+        tokio::time::advance(PERIOD * 7 / 2).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_a_late_flush_the_next_waits_a_full_period() {
+        let mut timer = flush_timer(PERIOD);
+        stall().await;
+        timer.tick().await;
+        let late_flush = Instant::now();
+        timer.tick().await;
+        assert_eq!(late_flush.elapsed(), PERIOD);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missed_snapshot_ticks_all_fire_at_once() {
+        let mut timer = snapshot_timer(PERIOD);
+        stall().await;
+        let caught_up_from = Instant::now();
+        for _ in 0..3 {
+            timer.tick().await;
+        }
+        assert_eq!(caught_up_from.elapsed(), Duration::ZERO);
     }
 
     #[test]

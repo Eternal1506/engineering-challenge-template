@@ -160,6 +160,22 @@ fn a_full_resnapshot_channel_counts_the_dropped_request() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A bookless request lost to a full channel still waits out the rate
+/// limit, so the later changes within it do not retry.
+#[test]
+fn a_full_channel_loses_one_bookless_request_per_interval() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let (requests, _receiver) = mpsc::channel(1);
+    requests.try_send(Arc::from("X"))?;
+    let change = |received| stamped(feed_level("A", bid(400_000, Delta(UNIT))), received, None);
+    let messages = vec![change(1), change(2), change(3)];
+    let run = run_writer(output.path(), messages, |config| {
+        config.resnapshot_requests = requests;
+    })?;
+    assert_eq!(run.stats.resnapshot_requests_dropped, 1);
+    Ok(())
+}
+
 #[test]
 fn forget_writes_a_final_snapshot_and_drops_the_book() -> anyhow::Result<()> {
     let output = NamedTempFile::new()?;
