@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 
 use crate::Side;
-use crate::core::events::QuantityChange;
+use crate::core::events::{LevelChange, QuantityChange};
 use crate::util::dtos::challenge_orderbook::{
     SnapshotAsksEntryDomain, SnapshotBidsEntryDomain, SnapshotDomain,
 };
@@ -41,34 +41,27 @@ pub struct AppliedChange {
 impl Book {
     /// Applies one level change and reports the level's quantity afterwards.
     ///
-    /// The last exchange time moves to `exchange_ts` unless it is already
-    /// later.
+    /// The last exchange time moves to `exchange_ts` unless that is `None` or
+    /// earlier.
     pub fn apply(
         &mut self,
-        side: Side,
-        price: i64,
-        change: QuantityChange,
-        exchange_ts: DateTime<Utc>,
+        change: LevelChange,
+        exchange_ts: Option<DateTime<Utc>>,
     ) -> AppliedChange {
-        self.last_exchange_ts = self.last_exchange_ts.max(Some(exchange_ts));
-        let levels = self.levels_mut(side);
-        let current = levels.get(&price).copied().unwrap_or(0);
-        let Some(quantity) = resulting_quantity(current, change) else {
-            levels.remove(&price);
-            self.needs_resnapshot = true;
-            return AppliedChange {
-                quantity: 0,
-                consistent: false,
-            };
-        };
-        if quantity == 0 {
-            levels.remove(&price);
+        self.last_exchange_ts = self.last_exchange_ts.max(exchange_ts);
+        let levels = self.levels_mut(change.side);
+        let current = levels.get(&change.price).copied().unwrap_or(0);
+        let resulting = resulting_quantity(current, change.change);
+        let quantity = resulting.unwrap_or(0);
+        if quantity > 0 {
+            levels.insert(change.price, quantity);
         } else {
-            levels.insert(price, quantity);
+            levels.remove(&change.price);
         }
+        self.needs_resnapshot |= resulting.is_none();
         AppliedChange {
             quantity,
-            consistent: true,
+            consistent: resulting.is_some(),
         }
     }
 
@@ -206,8 +199,23 @@ mod tests {
         (side_levels(book).0, book.needs_resnapshot())
     }
 
+    fn level(side: Side, price: i64, change: QuantityChange) -> LevelChange {
+        LevelChange {
+            side,
+            price,
+            change,
+        }
+    }
+
     fn apply_bid(book: &mut Book, change: QuantityChange) -> AppliedChange {
-        book.apply(Side::Buy, PRICE, change, ts(1))
+        book.apply(level(Side::Buy, PRICE, change), Some(ts(1)))
+    }
+
+    fn apply_at(book: &mut Book, side: Side, price: i64, seconds: i64) -> AppliedChange {
+        book.apply(
+            level(side, price, QuantityChange::Delta(1)),
+            Some(ts(seconds)),
+        )
     }
 
     #[test]
@@ -317,8 +325,8 @@ mod tests {
     #[test]
     fn last_exchange_ts_tracks_the_latest_apply() {
         let mut book = Book::default();
-        let bid = book.apply(Side::Buy, PRICE, QuantityChange::Delta(1), ts(5));
-        let ask = book.apply(Side::Sell, 600_000, QuantityChange::Delta(1), ts(9));
+        let bid = apply_at(&mut book, Side::Buy, PRICE, 5);
+        let ask = apply_at(&mut book, Side::Sell, 600_000, 9);
         assert_eq!((bid, ask), (consistent(1), consistent(1)));
         assert_eq!(book.last_exchange_ts(), Some(ts(9)));
     }
@@ -326,10 +334,18 @@ mod tests {
     #[test]
     fn apply_never_moves_the_exchange_time_backwards() {
         let mut book = Book::default();
-        let later = book.apply(Side::Buy, PRICE, QuantityChange::Delta(1), ts(9));
-        let earlier = book.apply(Side::Buy, PRICE, QuantityChange::Delta(1), ts(5));
+        let later = apply_at(&mut book, Side::Buy, PRICE, 9);
+        let earlier = apply_at(&mut book, Side::Buy, PRICE, 5);
         assert_eq!((later, earlier), (consistent(1), consistent(2)));
         assert_eq!(book.last_exchange_ts(), Some(ts(9)));
+    }
+
+    #[test]
+    fn apply_without_a_timestamp_keeps_the_previous_one() {
+        let mut book = book_with_bid(1_000_000);
+        let change = level(Side::Buy, PRICE, QuantityChange::Delta(1));
+        assert_eq!(book.apply(change, None), consistent(1_000_001));
+        assert_eq!(book.last_exchange_ts(), Some(ts(0)));
     }
 
     #[test]

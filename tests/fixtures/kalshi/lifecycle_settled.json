@@ -1,0 +1,11 @@
+{
+  "msg": {
+    "event_type": "settled",
+    "market_ticker": "KXATPMATCH-26OCT25FRITSI-FRI",
+    "settled_ts": 1793028734
+  },
+  "sending_ts_ms": 1793028734990,
+  "seq": 14,
+  "sid": 1,
+  "type": "market_lifecycle_v2"
+}

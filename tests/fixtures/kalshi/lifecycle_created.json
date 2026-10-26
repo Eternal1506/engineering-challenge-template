@@ -1,0 +1,32 @@
+{
+  "msg": {
+    "additional_metadata": {
+      "can_close_early": true,
+      "event_ticker": "KXSNLHOST-27",
+      "expected_expiration_ts": 1830265200,
+      "name": "Tina Fey",
+      "no_sub_title": "Tina Fey",
+      "rules_primary": "If Tina Fey is announced as the host of an episode of Saturday Night Live Season 52 before Dec 31, 2027, then the market resolves to Yes.",
+      "rules_secondary": "This market and these products have not been endorsed by Saturday Night Live or NBC. Any references to Saturday Night Live, NBC, or any associated marks are descriptive only and do not indicate an endorsement of this product or any affiliation between Saturday Night Live, NBC, and Kalshi.",
+      "title": "Who will host Saturday Night Live Season 52?",
+      "yes_sub_title": "Tina Fey"
+    },
+    "close_ts": 1830265200,
+    "event_type": "created",
+    "exchange_index": 0,
+    "market_ticker": "KXSNLHOST-27-TIN",
+    "open_ts": 1793030400,
+    "price_level_structure": "linear_cent",
+    "price_ranges": [
+      {
+        "end": "1.0000",
+        "start": "0.0000",
+        "step": "0.0100"
+      }
+    ]
+  },
+  "sending_ts_ms": 1793028856435,
+  "seq": 97,
+  "sid": 1,
+  "type": "market_lifecycle_v2"
+}

@@ -7,6 +7,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 
+use crate::core::events::{Command, Decoded};
+
 pub mod kalshi;
 
 /// The trading state of a market, in exchange-neutral terms.
@@ -50,4 +52,39 @@ pub trait MarketCatalog {
         status: MarketStatus,
         pages: mpsc::Sender<Vec<MarketInfo>>,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+/// Where an exchange's market-data websocket lives and how to authenticate
+/// to it.
+pub trait FeedEndpoint {
+    /// The websocket URL.
+    fn url(&self) -> &str;
+
+    /// The extra HTTP headers for a handshake made at `now`, such as a fresh
+    /// signature. Called once per connection attempt.
+    fn handshake_headers(&self, now: DateTime<Utc>) -> Vec<(&'static str, String)>;
+}
+
+/// Translates between an exchange's websocket messages and the core's
+/// [`Command`] and [`Decoded`] types.
+pub trait FeedCodec {
+    /// The text frame that sends `command`.
+    fn encode(&self, command: &Command) -> String;
+
+    /// Decodes one text frame received at `received_at`, appending every
+    /// message it carries to `out`. Message types the core does not use
+    /// decode to [`Inbound::Ignored`](crate::core::events::Inbound::Ignored),
+    /// still with their stream position, so sequence checks see them.
+    ///
+    /// Fails, appending nothing, if the frame is not valid JSON or a field
+    /// the core uses is missing or malformed; the error names the field and,
+    /// where known, the symbol. A frame that fails still used its slot in its
+    /// subscription's stream, so the next message on that subscription shows
+    /// a gap.
+    fn decode(
+        &self,
+        text: &str,
+        received_at: DateTime<Utc>,
+        out: &mut Vec<Decoded>,
+    ) -> anyhow::Result<()>;
 }

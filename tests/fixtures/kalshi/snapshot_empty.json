@@ -1,0 +1,10 @@
+{
+  "msg": {
+    "market_id": "01a178b9-9138-7eb6-88ea-e10a09b2cd4d",
+    "market_ticker": "KXMIDTERMMOV-LA06R-P13"
+  },
+  "sending_ts_ms": 1793028702777,
+  "seq": 546,
+  "sid": 1,
+  "type": "orderbook_snapshot"
+}

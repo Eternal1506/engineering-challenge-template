@@ -11,16 +11,20 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossbeam = "0.8.4"
 ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+log = "0.4"
 tokio = { version = "1", features = ["test-util"] }
+tracing-log = "0.2"
 wiremock = "0.6"
 
 [build-dependencies]

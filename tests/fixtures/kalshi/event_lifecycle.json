@@ -1,0 +1,14 @@
+{
+  "msg": {
+    "collateral_return_type": "MECNET",
+    "event_ticker": "KXITFMATCH-26OCT27FILTES",
+    "exchange_index": 3,
+    "series_ticker": "KXITFMATCH",
+    "subtitle": "",
+    "title": "Filip vs Tessa"
+  },
+  "sending_ts_ms": 1793028842998,
+  "seq": 90,
+  "sid": 1,
+  "type": "event_lifecycle"
+}

@@ -14,18 +14,15 @@ pub fn parse_kalshi_price(text: &str) -> anyhow::Result<i64> {
     Ok(price)
 }
 
-/// The YES ask price equivalent to a NO bid at `no_price`, both in fixed point.
+/// Parses the price of a NO bid, such as `"0.3000"`, and returns the
+/// equivalent YES ask price in fixed point.
 ///
 /// A contract pays 1 to whichever of YES and NO settles true, so buying NO at
 /// q is the same position as selling YES at 1 − q. Kalshi only publishes bids
 /// for each side, so a NO bid at q becomes an ask at 1 − q in the recorded
-/// book.
-///
-/// `no_price` must come from [`parse_kalshi_price`], which keeps it between
-/// 0 and 1, so the ask is also between 0 and 1.
-pub fn no_bid_to_ask_price(no_price: i64) -> i64 {
-    debug_assert!((0..=FIXED_POINT_SCALE).contains(&no_price));
-    FIXED_POINT_SCALE - no_price
+/// book. Fails like [`parse_kalshi_price`], so the ask is between 0 and 1.
+pub fn parse_no_bid_as_ask_price(text: &str) -> anyhow::Result<i64> {
+    Ok(FIXED_POINT_SCALE - parse_kalshi_price(text)?)
 }
 
 #[cfg(test)]
@@ -35,6 +32,11 @@ mod tests {
     #[test]
     fn accepts_a_price_of_one() {
         assert_eq!(parse_kalshi_price("1.0000").unwrap(), FIXED_POINT_SCALE);
+    }
+
+    #[test]
+    fn accepts_a_price_of_zero() {
+        assert_eq!(parse_kalshi_price("0.0000").unwrap(), 0);
     }
 
     #[test]
@@ -55,7 +57,18 @@ mod tests {
 
     #[test]
     fn no_bid_becomes_the_complementary_ask() {
-        let no_price = parse_kalshi_price("0.3000").unwrap();
-        assert_eq!(no_bid_to_ask_price(no_price), 700_000);
+        assert_eq!(parse_no_bid_as_ask_price("0.3000").unwrap(), 700_000);
+    }
+
+    #[test]
+    fn no_bids_at_the_ends_of_the_range_map_to_the_opposite_end() {
+        let asks = ["0", "1"].map(|text| parse_no_bid_as_ask_price(text).unwrap());
+        assert_eq!(asks, [FIXED_POINT_SCALE, 0]);
+    }
+
+    #[test]
+    fn no_bid_out_of_range_is_rejected() {
+        let error = parse_no_bid_as_ask_price("1.0001").unwrap_err();
+        assert!(error.to_string().contains("\"1.0001\""));
     }
 }
