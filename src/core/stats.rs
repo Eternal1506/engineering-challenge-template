@@ -100,8 +100,8 @@ pub struct CounterValues {
     pub resyncs_completed: u64,
     /// Resyncs whose deadline passed with symbols still unanswered.
     pub resyncs_overdue: u64,
-    /// Overdue resyncs that reconnected because an unanswered symbol
-    /// changed.
+    /// Overdue resyncs that requested a reconnect because an unanswered
+    /// symbol changed.
     pub resync_reconnects: u64,
     /// Level changes dropped while their symbol was resyncing.
     pub resync_drops: u64,
@@ -154,7 +154,7 @@ impl RecorderCounters {
         self.resyncs_overdue.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// An overdue resync reconnected.
+    /// An overdue resync requested a reconnect.
     pub fn note_resync_reconnect(&self) {
         self.resync_reconnects.fetch_add(1, Ordering::Relaxed);
     }
