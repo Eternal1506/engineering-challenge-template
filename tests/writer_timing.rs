@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use common::{
-    Recorded, feed_level, feed_snapshot, forget, level, read_recording, run_live, snapshot_sides,
-    stamped, track, verify_clean,
+    Recorded, at, feed_level, feed_snapshot, forget, level, read_recording, run_live,
+    snapshot_sides, stamped, track, verify_clean,
 };
 use engineering_challenge::Side;
 use engineering_challenge::core::events::FeedBody;
 use engineering_challenge::core::events::QuantityChange::{Absolute, Delta};
-use engineering_challenge::core::writer::{CHUNK_SIZE, WriterConfig, WriterMessage};
+use engineering_challenge::core::writer::{CHUNK_SIZE, STAMP_MARGIN, WriterConfig, WriterMessage};
 use engineering_challenge::util::dtos::challenge_orderbook::{
     PriceLevelUpdateDomain, SnapshotDomain,
 };
@@ -76,8 +76,10 @@ fn snapshot_times(messages: &[Recorded]) -> BTreeMap<String, Vec<DateTime<Utc>>>
     times
 }
 
-/// Sends a snapshot of each symbol, then for `run_for` keeps the stream
-/// clock moving with dropped level changes stamped with the elapsed time.
+/// Sends a snapshot of each symbol at stream time 0, then for `run_for`
+/// keeps the stream clock moving with dropped level changes. They are
+/// stamped [`STAMP_MARGIN`] ahead of the elapsed time, so the writer's own
+/// snapshots are stamped at about the elapsed time.
 fn send_with_moving_clock(
     sender: &mpsc::Sender<WriterMessage>,
     symbols: &[&str],
@@ -90,9 +92,46 @@ fn send_with_moving_clock(
     while started.elapsed() < run_for {
         let elapsed = started.elapsed().as_millis() as i64;
         let tick = feed_level("CLOCK", level(Side::Buy, 1, Delta(1)));
-        sender.blocking_send(stamped(tick, elapsed, None))?;
+        let clock = STAMP_MARGIN.num_milliseconds() + elapsed;
+        sender.blocking_send(stamped(tick, clock, None))?;
         std::thread::sleep(Duration::from_millis(1));
     }
+    Ok(())
+}
+
+#[test]
+fn quiet_books_are_snapshotted_at_the_advancing_stream_clock() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    run_live(output.path(), ticks(10, 4), |sender| {
+        send_with_moving_clock(sender, &["A", "B"], Duration::from_secs(1))
+    })?;
+    let times = snapshot_times(&read_recording(output.path())?);
+    let latest = times.values().filter_map(|t| t.last().copied()).min();
+    assert!(latest >= Some(at(800)), "{times:?}");
+    Ok(())
+}
+
+#[test]
+fn an_event_lagging_less_than_the_margin_keeps_its_true_time() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let snapshot = |symbol| feed_snapshot(symbol, &[(500_000, UNIT)], &[]);
+    let lagging = feed_level("A", level(Side::Buy, 500_000, Delta(1)));
+    run_live(output.path(), ticks(1, 1), |sender| {
+        sender.blocking_send(stamped(snapshot("A"), 0, None))?;
+        sender.blocking_send(stamped(snapshot("B"), 1000, None))?;
+        std::thread::sleep(Duration::from_millis(50));
+        sender.blocking_send(stamped(lagging, 500, None))?;
+        Ok(())
+    })?;
+    let recorded = read_recording(output.path())?;
+    let a_snapshots = snapshot_times(&recorded)["A"].len();
+    let a_update_times: Vec<_> = recorded
+        .iter()
+        .filter(|message| matches!(message, Recorded::Update(_)))
+        .map(common::received_at)
+        .collect();
+    assert!(a_snapshots >= 2, "no periodic snapshot of A: {recorded:?}");
+    assert_eq!(a_update_times, [at(500)]);
     Ok(())
 }
 

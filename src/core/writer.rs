@@ -4,10 +4,10 @@
 //!
 //! Output times are stream times, never the wall clock. The writer's clock is
 //! the latest receive time of any event it has processed, and the snapshots
-//! it makes itself are stamped with it. Every message's receive time is also
-//! held to at least the previous one written for its symbol, so each symbol's
-//! times never go backwards, even when events from different connections
-//! arrive slightly out of order.
+//! it makes itself are stamped [`STAMP_MARGIN`] behind it. Every message's
+//! receive time is also held to at least the previous one written for its
+//! symbol, so each symbol's times never go backwards, even when events from
+//! different connections arrive slightly out of order.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Interval};
 
@@ -39,6 +39,18 @@ pub const DEFAULT_SNAPSHOT_TICK: Duration = Duration::from_millis(250);
 /// snapshotted once every 240 × 250 ms = 60 s.
 pub const DEFAULT_SNAPSHOT_SLOTS: usize = 240;
 
+/// How far behind the writer's clock its own snapshots are stamped.
+///
+/// The clock is the latest receive time from any connection, and a
+/// connection that lags behind the others delivers events stamped before it.
+/// A snapshot stamped at the clock itself would force such an event's
+/// receive time forward to the snapshot's, losing its true time. Stamping
+/// 1 s behind keeps the true time of any event that lags by less than that;
+/// only heavier lag is floored. Quiet books still move forward with the
+/// stream, 1 s behind, so with 60 s snapshot cycles the gap between two
+/// snapshots of a book stays within 60 s + 1 s + one tick.
+pub const STAMP_MARGIN: TimeDelta = TimeDelta::seconds(1);
+
 /// The most messages the writer takes from its channel at once.
 const BATCH_SIZE: usize = 1024;
 
@@ -54,6 +66,10 @@ pub enum WriterMessage {
     /// Accept events for a symbol again after a [`Forget`](Self::Forget),
     /// for a market that has been registered again. Its book restarts from
     /// its next snapshot.
+    ///
+    /// Send it, and await the send, before subscribing the market again.
+    /// Otherwise the new subscription's snapshot can reach the writer while
+    /// the symbol is still forgotten, and be dropped.
     Track(Arc<str>),
 }
 
@@ -214,9 +230,10 @@ impl TrackedBook {
         }
     }
 
-    /// The receive time for the symbol's next message: `at`, or the previous
-    /// message's if that was later.
-    fn stamp(&mut self, at: DateTime<Utc>) -> DateTime<Utc> {
+    /// Moves the symbol's last written time forward to `at`, unless it is
+    /// already later, and returns it as the receive time for the symbol's
+    /// next message.
+    fn advance_to(&mut self, at: DateTime<Utc>) -> DateTime<Utc> {
         self.last_written_at = self.last_written_at.max(at);
         self.last_written_at
     }
@@ -304,7 +321,7 @@ impl BookWriter {
         let (bids, asks) = (bids.iter().copied(), asks.iter().copied());
         tracked.book.replace(bids, asks, event.exchange_ts);
         tracked.resnapshot_requested = false;
-        let received_at = tracked.stamp(event.received_at);
+        let received_at = tracked.advance_to(event.received_at);
         let snapshot = tracked.book.to_snapshot(&event.symbol, received_at);
         self.output.write_snapshot(&snapshot)
     }
@@ -318,7 +335,7 @@ impl BookWriter {
             self.drop_before_snapshot(&event.symbol);
             return Ok(());
         };
-        let backtest_timestamp = tracked.stamp(event.received_at);
+        let backtest_timestamp = tracked.advance_to(event.received_at);
         let applied = tracked.book.apply(change, event.exchange_ts);
         let exchange_ts = tracked.book.last_exchange_ts();
         if !applied.consistent {
@@ -368,23 +385,29 @@ impl BookWriter {
             return Ok(());
         };
         self.schedule.remove(&symbol, tracked.slot);
-        let received_at = tracked.stamp(self.clock);
+        let received_at = tracked.advance_to(self.own_snapshot_time());
         let snapshot = tracked.book.to_snapshot(&symbol, received_at);
         self.forgotten.insert(symbol);
         self.output.write_snapshot(&snapshot)
     }
 
-    /// Snapshots every book whose slot is due on this tick, at the writer's
-    /// clock.
+    /// Snapshots every book whose slot is due on this tick.
     fn write_due_snapshots(&mut self) -> anyhow::Result<()> {
+        let snapshot_time = self.own_snapshot_time();
         for symbol in self.schedule.next_due() {
             if let Some(tracked) = self.books.get_mut(symbol) {
-                let received_at = tracked.stamp(self.clock);
+                let received_at = tracked.advance_to(snapshot_time);
                 self.output
                     .write_snapshot(&tracked.book.to_snapshot(symbol, received_at))?;
             }
         }
         Ok(())
+    }
+
+    /// The time for a snapshot the writer makes itself, before the floor at
+    /// the symbol's last written time: [`STAMP_MARGIN`] behind the clock.
+    fn own_snapshot_time(&self) -> DateTime<Utc> {
+        self.clock - STAMP_MARGIN
     }
 
     /// Flushes the final chunk, closes the output and reports the stats.
