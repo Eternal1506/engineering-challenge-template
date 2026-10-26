@@ -6,10 +6,15 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// Paces requests to a steady rate, allowing a burst of up to one second's
-/// worth. Callers that arrive while the bucket is empty queue up in order.
+/// Paces requests to a steady rate, allowing a burst of up to `capacity`
+/// requests after an idle spell. Callers that arrive while the bucket is empty
+/// queue up in order.
+///
+/// The budget covers only the requests made through this bucket. Every task
+/// that shares a rate limit must share one bucket.
 pub(crate) struct TokenBucket {
     per_second: f64,
+    capacity: f64,
     state: Mutex<BucketState>,
 }
 
@@ -19,13 +24,15 @@ struct BucketState {
 }
 
 impl TokenBucket {
-    /// A full bucket that refills at `per_second` tokens per second.
-    pub(crate) fn new(per_second: u32) -> Self {
-        let per_second = f64::from(per_second);
+    /// A full bucket of `capacity` tokens that refills at `per_second` tokens
+    /// per second.
+    pub(crate) fn new(per_second: u32, capacity: u32) -> Self {
+        let capacity = f64::from(capacity);
         Self {
-            per_second,
+            per_second: f64::from(per_second),
+            capacity,
             state: Mutex::new(BucketState {
-                tokens: per_second,
+                tokens: capacity,
                 refilled_at: Instant::now(),
             }),
         }
@@ -42,7 +49,7 @@ impl TokenBucket {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         let refill = now.duration_since(state.refilled_at).as_secs_f64() * self.per_second;
-        state.tokens = (state.tokens + refill).min(self.per_second) - 1.0;
+        state.tokens = (state.tokens + refill).min(self.capacity) - 1.0;
         state.refilled_at = now;
         Duration::from_secs_f64((-state.tokens).max(0.0) / self.per_second)
     }
@@ -76,39 +83,34 @@ impl Backoff {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn full_bucket_allows_one_second_of_requests_at_once() {
-        let bucket = TokenBucket::new(15);
+    async fn seconds_to_acquire(bucket: &TokenBucket, count: usize) -> f64 {
         let start = Instant::now();
-        for _ in 0..15 {
+        for _ in 0..count {
             bucket.acquire().await;
         }
-        assert_eq!(start.elapsed(), Duration::ZERO);
+        start.elapsed().as_secs_f64()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_bucket_allows_a_burst_of_its_capacity() {
+        let bucket = TokenBucket::new(15, 5);
+        assert_eq!(seconds_to_acquire(&bucket, 5).await, 0.0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn empty_bucket_spaces_requests_at_the_refill_rate() {
-        let bucket = TokenBucket::new(15);
-        let start = Instant::now();
-        for _ in 0..45 {
-            bucket.acquire().await;
-        }
-        let elapsed = start.elapsed().as_secs_f64();
+        let bucket = TokenBucket::new(15, 5);
+        let elapsed = seconds_to_acquire(&bucket, 35).await;
         assert!((elapsed - 2.0).abs() < 0.01, "elapsed {elapsed} s");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_time_refills_the_bucket() {
-        let bucket = TokenBucket::new(15);
-        for _ in 0..15 {
-            bucket.acquire().await;
-        }
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let start = Instant::now();
-        for _ in 0..15 {
-            bucket.acquire().await;
-        }
-        assert_eq!(start.elapsed(), Duration::ZERO);
+    async fn idle_time_refills_the_bucket_only_up_to_its_capacity() {
+        let bucket = TokenBucket::new(15, 5);
+        seconds_to_acquire(&bucket, 5).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let elapsed = seconds_to_acquire(&bucket, 6).await;
+        assert!((elapsed - 1.0 / 15.0).abs() < 0.002, "elapsed {elapsed} s");
     }
 
     #[test]

@@ -39,19 +39,34 @@ pub struct MarketInfo {
     pub close_ts: Option<DateTime<Utc>>,
 }
 
+/// What a finished listing could not deliver.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ListingReport {
+    /// Markets the exchange returned that could not be parsed, and so are
+    /// missing from the pages. While this is non-empty, a market's absence
+    /// from the listing is no evidence that it has gone.
+    pub skipped: Vec<Arc<str>>,
+}
+
 /// An exchange's list of markets.
 pub trait MarketCatalog {
-    /// Lists every market with `status`, sending each page to `pages` as it
-    /// arrives so the caller can act before the listing finishes.
+    /// Lists the markets the exchange returns for the `status` filter, sending
+    /// each non-empty page to `pages` as it arrives so the caller can act
+    /// before the listing finishes.
     ///
-    /// Returns once the last page has been sent. Fails if the exchange cannot
-    /// be reached after retries, a market cannot be parsed, or `pages` is
-    /// closed before the listing finishes.
+    /// Each [`MarketInfo::status`] is that market's own current state, which
+    /// can differ from the filter (a `Paused` listing on Kalshi includes some
+    /// closed markets). Callers decide what to do from [`MarketInfo::status`].
+    ///
+    /// A market that cannot be parsed is logged and skipped, and named in the
+    /// returned [`ListingReport`]. Fails if the exchange cannot be reached
+    /// after retries, its pagination misbehaves, or `pages` is closed before
+    /// the listing finishes.
     fn list_markets(
         &self,
         status: MarketStatus,
         pages: mpsc::Sender<Vec<MarketInfo>>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> impl Future<Output = anyhow::Result<ListingReport>> + Send;
 }
 
 /// Where an exchange's market-data websocket lives and how to authenticate

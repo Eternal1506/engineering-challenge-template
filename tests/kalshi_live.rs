@@ -16,7 +16,8 @@ use engineering_challenge::exchange::{MarketCatalog, MarketInfo, MarketStatus};
 use reqwest::{StatusCode, Url};
 use tokio::sync::mpsc;
 
-/// Lists every market with `status`, printing the page count and timing.
+/// Lists every market with `status`, printing the page count and timing, and
+/// checks that no market was skipped.
 async fn list_all(status: MarketStatus) -> Vec<MarketInfo> {
     let catalog = KalshiCatalog::production().unwrap();
     let (sender, mut receiver) = mpsc::channel(4);
@@ -29,12 +30,14 @@ async fn list_all(status: MarketStatus) -> Vec<MarketInfo> {
         pages
     };
     let (listing, pages) = tokio::join!(catalog.list_markets(status, sender), collect);
-    listing.unwrap();
+    let report = listing.unwrap();
     println!(
-        "{status:?}: {} pages in {:.1} s",
+        "{status:?}: {} pages in {:.1} s, {} skipped",
         pages.len(),
-        start.elapsed().as_secs_f64()
+        start.elapsed().as_secs_f64(),
+        report.skipped.len()
     );
+    assert_eq!(report.skipped, Vec::<std::sync::Arc<str>>::new());
     pages.into_iter().flatten().collect()
 }
 
