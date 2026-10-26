@@ -6,14 +6,22 @@ build = "src/util/build.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.23"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossbeam = "0.8.4"
+ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6"
 
 [build-dependencies]
 ergo-sbe = "=0.1.16"

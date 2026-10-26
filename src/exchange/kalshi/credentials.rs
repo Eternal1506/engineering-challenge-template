@@ -38,10 +38,6 @@ impl KalshiCredentials {
     }
 
     /// The PEM-encoded private key that signs requests.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the request signer in a later step")
-    )]
     pub(crate) fn private_key_pem(&self) -> &str {
         &self.private_key_pem
     }
