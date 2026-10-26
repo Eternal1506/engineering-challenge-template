@@ -10,6 +10,8 @@ mod mock_exchange;
 mod lifecycle;
 #[path = "recorder/recovery.rs"]
 mod recovery;
+#[path = "recorder/resync.rs"]
+mod resync;
 #[path = "recorder/sharding.rs"]
 mod sharding;
 #[path = "recorder/shutdown.rs"]

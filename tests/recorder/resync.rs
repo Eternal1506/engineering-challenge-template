@@ -1,0 +1,341 @@
+//! Resyncing a shard's markets after a sequence gap.
+
+use engineering_challenge::exchange::MarketStatus;
+
+use super::mock_exchange::{SentCommand, market};
+use super::recovery::recording_two_shards;
+use super::*;
+
+/// A recorder with one shard over A and B, both books recorded, whose
+/// resyncs time out after `resync_timeout`.
+async fn recording_one_shard(server: &MockServer, resync_timeout: Duration) -> (Recorder, Shard) {
+    let config = CoordinatorConfig {
+        resync_timeout,
+        ..config(2)
+    };
+    let mut recorder = Recorder::start_with(server, config);
+    recorder.list_open(&["A", "B"]);
+    let mut shard = Shard::accept(server, 1).await;
+    shard.send_books().await;
+    recorder.output.wait_for(2, 0).await;
+    (recorder, shard)
+}
+
+/// A coordinator, driven by the test, with shards of `shard_size` whose
+/// resyncs time out after `resync_timeout`, recording A and B on one shard
+/// with both books recorded.
+async fn pipeline_of_a_and_b(
+    server: &MockServer,
+    shard_size: usize,
+    resync_timeout: Duration,
+) -> (Pipeline, Shard) {
+    let config = CoordinatorConfig {
+        resync_timeout,
+        ..config(shard_size)
+    };
+    let mut pipeline = Pipeline::new(server, config);
+    let markets = ["A", "B"].map(|symbol| market(symbol, MarketStatus::Open));
+    pipeline.coordinator.add_markets(markets.to_vec()).await;
+    let mut shard = Shard::accept(server, 1).await;
+    shard.send_books().await;
+    pipeline.output.wait_for(2, 0).await;
+    (pipeline, shard)
+}
+
+/// Shuts `pipeline` down, answering `shard`'s close, and checks the
+/// recording.
+async fn shut_down(pipeline: Pipeline, shard: Shard) -> Finished {
+    let closes = answer_closes(vec![shard]);
+    pipeline.coordinator.shutdown().await;
+    closed(closes).await;
+    pipeline.output.finish().await
+}
+
+/// Skips two sequence numbers on `shard` with a +10 bid change for
+/// `symbol`, and returns the snapshot request the gap brings.
+async fn open_gap(shard: &mut Shard, symbol: &str) -> SentCommand {
+    shard.seq += 2;
+    raise(shard, symbol).await;
+    shard.client.next_command().await
+}
+
+/// Sends a +10 bid change for `symbol` at 0.40, where every sent book has
+/// 100.
+async fn raise(shard: &mut Shard, symbol: &str) {
+    shard.send_level(symbol, ("buy", 400_000, 10)).await;
+}
+
+/// Answers `request` with the standard book for `symbol`.
+async fn answer(shard: &mut Shard, request: &SentCommand, symbol: &str) {
+    let seq = shard.next_seq();
+    let reply = frames::book(shard.sub, seq, symbol, (BIDS, ASKS));
+    shard.client.reply(request, reply).await;
+}
+
+/// Sends the standard book for `symbol` unprompted.
+async fn send_book(shard: &mut Shard, symbol: &str) {
+    let seq = shard.next_seq();
+    let frame = frames::book(shard.sub, seq, symbol, (BIDS, ASKS));
+    shard.client.send(frame).await;
+}
+
+/// A book as sent, then a fresh copy of it, then the +10 change on it.
+fn resynced_then_raised() -> Vec<Shape> {
+    vec![
+        sent_book(),
+        sent_book(),
+        Shape::Update(Side::Buy, 400_000, 110),
+    ]
+}
+
+/// The resync counts: completed in time, overdue, and reconnected.
+fn resync_counts(counters: &RecorderCounters) -> (u64, u64, u64) {
+    let counts = counters.read();
+    let (completed, overdue) = (counts.resyncs_completed, counts.resyncs_overdue);
+    (completed, overdue, counts.resync_reconnects)
+}
+
+#[tokio::test]
+async fn a_gap_requests_a_snapshot_of_every_market_of_its_shard() {
+    let server = MockServer::start().await;
+    let (recorder, mut shards) = recording_two_shards(&server).await;
+    let gapped = owner_of(&mut shards, "A");
+    let request = open_gap(gapped, "A").await;
+    let (sub, mut owned) = (gapped.sub, gapped.symbols.clone());
+    let closes = answer_closes(shards);
+    recorder.stop().await;
+    closed(closes).await;
+    owned.sort();
+    let asked = (request.cmd.as_str(), request.sub, request.symbols);
+    assert_eq!(asked, ("snapshot", Some(sub), owned));
+}
+
+#[tokio::test]
+async fn a_gap_sends_nothing_to_the_other_shard() {
+    let server = MockServer::start().await;
+    let (recorder, mut shards) = recording_two_shards(&server).await;
+    open_gap(owner_of(&mut shards, "A"), "A").await;
+    let other = shards.iter_mut().find(|shard| !shard.owns("A")).unwrap();
+    other
+        .client
+        .assert_no_command(Duration::from_millis(300))
+        .await;
+    let closes = answer_closes(shards);
+    recorder.stop().await;
+    closed(closes).await;
+}
+
+/// The change that reveals the gap and the one before A's snapshot are
+/// dropped; the one after it applies to the fresh book.
+#[tokio::test]
+async fn a_markets_changes_are_dropped_from_a_gap_until_its_snapshot() {
+    let server = MockServer::start().await;
+    let (recorder, mut shard) = recording_one_shard(&server, Duration::from_secs(5)).await;
+    let request = open_gap(&mut shard, "A").await;
+    raise(&mut shard, "A").await;
+    answer(&mut shard, &request, "A").await;
+    raise(&mut shard, "A").await;
+    recorder.output.wait_for(3, 1).await;
+    let counters = recorder.counters.clone();
+    let closes = answer_closes(vec![shard]);
+    let (_, finished) = recorder.stop().await;
+    closed(closes).await;
+    let dropped = counters.read().resync_drops;
+    assert_eq!((finished.of("A"), dropped), (resynced_then_raised(), 2));
+}
+
+/// B's change after A's snapshot is still dropped, and A's applied; B's
+/// change after its own snapshot is applied.
+#[tokio::test]
+async fn each_market_leaves_the_resync_on_its_own_snapshot() {
+    let server = MockServer::start().await;
+    let (recorder, mut shard) = recording_one_shard(&server, Duration::from_secs(5)).await;
+    let request = open_gap(&mut shard, "A").await;
+    answer(&mut shard, &request, "A").await;
+    raise(&mut shard, "B").await;
+    raise(&mut shard, "A").await;
+    answer(&mut shard, &request, "B").await;
+    raise(&mut shard, "B").await;
+    recorder.output.wait_for(4, 2).await;
+    let closes = answer_closes(vec![shard]);
+    let (_, finished) = recorder.stop().await;
+    closed(closes).await;
+    let both = (finished.of("A"), finished.of("B"));
+    assert_eq!(both, (resynced_then_raised(), resynced_then_raised()));
+}
+
+/// Every snapshot arrives well before the deadline, which then passes
+/// without a reconnect.
+#[tokio::test]
+async fn a_resync_answered_in_time_keeps_the_socket() {
+    let server = MockServer::start().await;
+    let (recorder, mut shard) = recording_one_shard(&server, Duration::from_millis(500)).await;
+    let request = open_gap(&mut shard, "A").await;
+    answer(&mut shard, &request, "A").await;
+    answer(&mut shard, &request, "B").await;
+    shard.client.assert_no_command(Duration::from_secs(1)).await;
+    let handshakes = server.handshake_attempts();
+    let counters = recorder.counters.clone();
+    let closes = answer_closes(vec![shard]);
+    recorder.stop().await;
+    closed(closes).await;
+    assert_eq!((handshakes, resync_counts(&counters)), (1, (1, 0, 0)));
+}
+
+/// B never answers and never changes, like a market the exchange dropped:
+/// the deadline passes without a reconnect, and A keeps recording.
+#[tokio::test]
+async fn a_silent_market_past_the_deadline_is_held_without_a_reconnect() {
+    let server = MockServer::start().await;
+    let (recorder, mut shard) = recording_one_shard(&server, Duration::from_millis(300)).await;
+    let request = open_gap(&mut shard, "A").await;
+    answer(&mut shard, &request, "A").await;
+    let past_the_deadline = Duration::from_millis(800);
+    shard.client.assert_no_command(past_the_deadline).await;
+    raise(&mut shard, "A").await;
+    recorder.output.wait_for(3, 1).await;
+    let handshakes = server.handshake_attempts();
+    let counters = recorder.counters.clone();
+    let closes = answer_closes(vec![shard]);
+    let (_, finished) = recorder.stop().await;
+    closed(closes).await;
+    let outcome = (finished.of("A"), handshakes, resync_counts(&counters));
+    assert_eq!(outcome, (resynced_then_raised(), 1, (0, 1, 0)));
+}
+
+/// B changes after the deadline: that change is dropped and the shard
+/// reconnects. B's subscribe snapshot on the new socket comes before any
+/// later change of B is written.
+#[tokio::test]
+async fn a_change_to_a_market_past_the_deadline_reconnects_the_shard() {
+    let server = MockServer::start().await;
+    let (recorder, mut gapped) = recording_one_shard(&server, Duration::from_millis(300)).await;
+    let request = open_gap(&mut gapped, "A").await;
+    answer(&mut gapped, &request, "A").await;
+    let past_the_deadline = Duration::from_millis(800);
+    gapped.client.assert_no_command(past_the_deadline).await;
+    raise(&mut gapped, "B").await;
+    let mut reconnected = Shard::accept(&server, 2).await;
+    reconnected.send_books().await;
+    raise(&mut reconnected, "B").await;
+    recorder.output.wait_for(5, 1).await;
+    let counters = recorder.counters.clone();
+    let closes = answer_closes(vec![reconnected]);
+    let (_, finished) = recorder.stop().await;
+    closed(closes).await;
+    let outcome = (finished.of("B"), resync_counts(&counters));
+    assert_eq!(outcome, (resynced_then_raised(), (0, 1, 1)));
+}
+
+/// The second gap comes before the first deadline and the replies after
+/// it, but before the second deadline: the resync completes in time.
+#[tokio::test]
+async fn a_second_gap_during_a_resync_restarts_it() {
+    let server = MockServer::start().await;
+    let (recorder, mut shard) = recording_one_shard(&server, Duration::from_secs(2)).await;
+    let first = open_gap(&mut shard, "A").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let second = open_gap(&mut shard, "B").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    answer(&mut shard, &second, "A").await;
+    answer(&mut shard, &second, "B").await;
+    raise(&mut shard, "A").await;
+    recorder.output.wait_for(4, 1).await;
+    let handshakes = server.handshake_attempts();
+    let counters = recorder.counters.clone();
+    let closes = answer_closes(vec![shard]);
+    let (_, finished) = recorder.stop().await;
+    closed(closes).await;
+    assert_ne!(first.id, second.id);
+    let outcome = (finished.of("A"), handshakes, resync_counts(&counters));
+    assert_eq!(outcome, (resynced_then_raised(), 1, (1, 0, 0)));
+}
+
+/// A server close mid-resync: the new socket's subscribe snapshots release
+/// both markets long before the deadline.
+#[tokio::test]
+async fn a_new_socket_releases_the_held_markets_before_the_deadline() {
+    let server = MockServer::start().await;
+    let (recorder, mut gapped) = recording_one_shard(&server, Duration::from_secs(10)).await;
+    open_gap(&mut gapped, "A").await;
+    gapped.client.close().await;
+    let mut reconnected = Shard::accept(&server, 2).await;
+    reconnected.send_books().await;
+    raise(&mut reconnected, "A").await;
+    raise(&mut reconnected, "B").await;
+    recorder.output.wait_for(4, 2).await;
+    let counters = recorder.counters.clone();
+    let closes = answer_closes(vec![reconnected]);
+    let (_, finished) = recorder.stop().await;
+    closed(closes).await;
+    let both = (finished.of("A"), finished.of("B"));
+    let expected = (resynced_then_raised(), resynced_then_raised());
+    assert_eq!((both, resync_counts(&counters)), (expected, (0, 0, 0)));
+}
+
+/// The socket drops mid-resync and stays down past the deadline. That stops
+/// the resync clock, so nothing counts as overdue, and the new socket
+/// releases both markets.
+#[tokio::test]
+async fn a_deadline_passing_while_the_socket_is_down_is_not_overdue() {
+    let server = MockServer::start().await;
+    let (recorder, mut gapped) = recording_one_shard(&server, Duration::from_millis(300)).await;
+    open_gap(&mut gapped, "A").await;
+    gapped.client.close().await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut reconnected = Shard::accept(&server, 2).await;
+    reconnected.send_books().await;
+    raise(&mut reconnected, "A").await;
+    recorder.output.wait_for(4, 1).await;
+    let counters = recorder.counters.clone();
+    let closes = answer_closes(vec![reconnected]);
+    let (_, finished) = recorder.stop().await;
+    closed(closes).await;
+    let outcome = (finished.of("A"), resync_counts(&counters));
+    assert_eq!(outcome, (resynced_then_raised(), (0, 0, 0)));
+}
+
+/// A answers and B is removed: nothing is left to wait for, so the resync
+/// completes and the deadline passes without a reconnect.
+#[tokio::test]
+async fn removing_the_last_unanswered_market_completes_the_resync() {
+    let server = MockServer::start().await;
+    let timeout = Duration::from_millis(500);
+    let (mut pipeline, mut shard) = pipeline_of_a_and_b(&server, 2, timeout).await;
+    let request = open_gap(&mut shard, "A").await;
+    answer(&mut shard, &request, "A").await;
+    pipeline.coordinator.remove_market("B".into()).await;
+    let remove = shard.client.next_command().await;
+    shard.client.assert_no_command(Duration::from_secs(1)).await;
+    let handshakes = server.handshake_attempts();
+    let counters = pipeline.coordinator.counters();
+    shut_down(pipeline, shard).await;
+    let outcome = (remove.cmd.as_str(), handshakes, resync_counts(&counters));
+    assert_eq!(outcome, ("remove", 1, (1, 0, 0)));
+}
+
+/// C joins the shard during a resync of A and B. The resync completes on
+/// A's and B's snapshots alone, and C records from its subscribe snapshot.
+#[tokio::test]
+async fn a_market_added_during_a_resync_is_not_held() {
+    let server = MockServer::start().await;
+    let timeout = Duration::from_secs(5);
+    let (mut pipeline, mut shard) = pipeline_of_a_and_b(&server, 3, timeout).await;
+    let request = open_gap(&mut shard, "A").await;
+    let markets = vec![market("C", MarketStatus::Open)];
+    pipeline.coordinator.add_markets(markets).await;
+    let add = shard.client.next_command().await;
+    answer(&mut shard, &request, "A").await;
+    answer(&mut shard, &request, "B").await;
+    pipeline.output.wait_for(4, 0).await;
+    let completed = pipeline.coordinator.counters().read().resyncs_completed;
+    let ack = frames::ack(shard.sub, shard.next_seq());
+    shard.client.reply(&add, ack).await;
+    send_book(&mut shard, "C").await;
+    raise(&mut shard, "C").await;
+    pipeline.output.wait_for(5, 1).await;
+    let finished = shut_down(pipeline, shard).await;
+    let raised = vec![sent_book(), Shape::Update(Side::Buy, 400_000, 110)];
+    let outcome = (add.symbols, completed, finished.of("C"));
+    assert_eq!(outcome, (vec!["C".to_owned()], 1, raised));
+}

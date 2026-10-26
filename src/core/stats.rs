@@ -34,8 +34,8 @@ pub struct RecorderCounters {
     connections_up: AtomicUsize,
     disconnects: AtomicU64,
     gaps: AtomicU64,
-    resyncs_started: AtomicU64,
     resyncs_completed: AtomicU64,
+    resyncs_overdue: AtomicU64,
     resync_reconnects: AtomicU64,
     resync_drops: AtomicU64,
     resnapshot_requests: AtomicU64,
@@ -92,14 +92,16 @@ pub struct CounterValues {
     pub connections_up: usize,
     /// Connected sockets that were lost.
     pub disconnects: u64,
-    /// Sequence gaps seen.
+    /// Sequence gaps seen, each starting a resync. A resync completes,
+    /// becomes overdue, is restarted by another gap, or is ended by a new
+    /// socket.
     pub gaps: u64,
-    /// Resyncs started, one per gap. Each one completes, times out, is
-    /// restarted by another gap, or is ended by a new socket.
-    pub resyncs_started: u64,
     /// Resyncs that got a snapshot of every symbol before their deadline.
     pub resyncs_completed: u64,
-    /// Resyncs that timed out and reconnected.
+    /// Resyncs whose deadline passed with symbols still unanswered.
+    pub resyncs_overdue: u64,
+    /// Overdue resyncs that reconnected because an unanswered symbol
+    /// changed.
     pub resync_reconnects: u64,
     /// Level changes dropped while their symbol was resyncing.
     pub resync_drops: u64,
@@ -142,17 +144,17 @@ impl RecorderCounters {
         self.gaps.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A gap started a resync.
-    pub fn note_resync_started(&self) {
-        self.resyncs_started.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// A resync got a snapshot of every symbol in time.
     pub fn note_resync_completed(&self) {
         self.resyncs_completed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A resync timed out and reconnected.
+    /// A resync's deadline passed with symbols unanswered.
+    pub fn note_resync_overdue(&self) {
+        self.resyncs_overdue.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An overdue resync reconnected.
     pub fn note_resync_reconnect(&self) {
         self.resync_reconnects.fetch_add(1, Ordering::Relaxed);
     }
@@ -194,8 +196,8 @@ impl RecorderCounters {
             connections_up: self.connections_up.load(Ordering::Relaxed),
             disconnects: self.disconnects.load(Ordering::Relaxed),
             gaps: self.gaps.load(Ordering::Relaxed),
-            resyncs_started: self.resyncs_started.load(Ordering::Relaxed),
             resyncs_completed: self.resyncs_completed.load(Ordering::Relaxed),
+            resyncs_overdue: self.resyncs_overdue.load(Ordering::Relaxed),
             resync_reconnects: self.resync_reconnects.load(Ordering::Relaxed),
             resync_drops: self.resync_drops.load(Ordering::Relaxed),
             resnapshot_requests: self.resnapshot_requests.load(Ordering::Relaxed),
@@ -304,8 +306,8 @@ impl StatsReporter {
             writer_peak = self.peak_depth,
             resnapshots = counts.resnapshot_requests,
             gaps = counts.gaps,
-            resyncs = counts.resyncs_started,
             resyncs_completed = counts.resyncs_completed,
+            resyncs_overdue = counts.resyncs_overdue,
             resync_reconnects = counts.resync_reconnects,
             resync_drops = counts.resync_drops,
             disconnects = counts.disconnects,
