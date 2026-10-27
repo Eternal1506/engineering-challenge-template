@@ -1,6 +1,8 @@
 //! The writer thread: it owns every [`Book`] and the SBE output, turns feed
 //! events into `Snapshot` and `PriceLevelUpdate` messages, and snapshots every
-//! book once per cycle, with the books staggered across the cycle.
+//! book once per cycle, with the books staggered across the cycle. It also
+//! checks the books against the snapshots the shards ask for to audit them,
+//! writing only those that differ.
 //!
 //! Output times are stream times, never the wall clock. The writer's clock is
 //! the latest receive time of any event it has processed, and the snapshots
@@ -11,6 +13,7 @@
 
 mod bookless;
 mod forgotten;
+mod mismatches;
 mod progress;
 
 use std::collections::HashMap;
@@ -25,14 +28,15 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 use self::bookless::BooklessRequests;
-use crate::core::book::Book;
+use self::mismatches::MismatchWarnings;
+use crate::core::book::{Book, LevelDifference};
 use crate::core::events::{FeedBody, FeedEvent, LevelChange};
 use crate::util::AlignedSbeWriter;
 use crate::util::dtos::challenge_orderbook::{PriceLevelUpdateDomain, SnapshotDomain};
 
 pub use forgotten::FORGOTTEN_RETENTION;
 pub(crate) use forgotten::Forgotten;
-pub use progress::WriterProgress;
+pub use progress::{AuditCounts, WriterProgress};
 
 /// The output chunk size. `AlignedSbeReader` reads 64 MiB chunks, so the
 /// writer must write the same size.
@@ -68,6 +72,14 @@ const BATCH_SIZE: usize = 1024;
 pub enum WriterMessage {
     /// Apply a feed event to its book and write it.
     Event(FeedEvent),
+    /// Check a symbol's book against a snapshot the exchange sent to audit
+    /// it. A snapshot that matches the book level for level writes
+    /// nothing; one that differs is logged with the differing levels, at
+    /// warn at most once a minute and at debug otherwise, then
+    /// handled as an [`Event`](Self::Event), replacing the book and
+    /// writing it. Anything else, or a snapshot of a symbol without a
+    /// book, is handled as an `Event` too.
+    Audit(FeedEvent),
     /// Write a final snapshot of the symbol's book, then drop the book, for a
     /// market that has stopped trading. Every later event for the symbol is
     /// dropped until a [`Track`](Self::Track) for it, or until
@@ -228,6 +240,8 @@ struct BookWriter {
     /// Symbols without a book, and when their level changes last tried to
     /// ask for a snapshot.
     bookless: BooklessRequests,
+    /// When the writer last warned about an audit mismatch.
+    mismatches: MismatchWarnings,
     schedule: SnapshotSchedule,
     /// The latest receive time of any event processed.
     clock: DateTime<Utc>,
@@ -273,6 +287,7 @@ impl BookWriter {
             books: HashMap::new(),
             forgotten: Forgotten::default(),
             bookless: BooklessRequests::default(),
+            mismatches: MismatchWarnings::default(),
             schedule: SnapshotSchedule::new(config.snapshot_slots),
             clock: DateTime::UNIX_EPOCH,
             resnapshot_requests: config.resnapshot_requests.clone(),
@@ -322,6 +337,7 @@ impl BookWriter {
     fn handle(&mut self, message: WriterMessage) -> anyhow::Result<()> {
         match message {
             WriterMessage::Event(event) => self.handle_event(&event),
+            WriterMessage::Audit(event) => self.handle_audit(&event),
             WriterMessage::Forget(symbol) => self.forget(symbol),
             WriterMessage::Track(symbol) => {
                 self.forgotten.remove(&symbol);
@@ -330,9 +346,44 @@ impl BookWriter {
         }
     }
 
-    fn handle_event(&mut self, event: &FeedEvent) -> anyhow::Result<()> {
+    /// Compares an audit snapshot with its symbol's book: a match is only
+    /// counted, and a mismatch is counted, logged and written as the
+    /// symbol's new book.
+    fn handle_audit(&mut self, event: &FeedEvent) -> anyhow::Result<()> {
+        let Some(differences) = self.audit_differences(event) else {
+            return self.handle_event(event);
+        };
+        if differences.is_empty() {
+            self.output.progress.note_audit_match();
+            self.note_received(event);
+            return Ok(());
+        }
+        self.output.progress.note_audit_mismatch();
+        let now = Instant::now();
+        self.mismatches.log(&event.symbol, &differences, now);
+        self.handle_event(event)
+    }
+
+    /// How `event`'s snapshot differs from its symbol's book; `None` if it
+    /// is not a snapshot, or the symbol has no book or is forgotten.
+    fn audit_differences(&self, event: &FeedEvent) -> Option<Vec<LevelDifference>> {
+        let FeedBody::Snapshot { bids, asks } = &event.body else {
+            return None;
+        };
+        let book = &self.books.get(&event.symbol)?.book;
+        let forgotten = self.forgotten.contains(&event.symbol);
+        let (bids, asks) = (bids.iter().copied(), asks.iter().copied());
+        (!forgotten).then(|| book.differences(bids, asks))
+    }
+
+    /// Counts `event` and moves the clock to its receive time.
+    fn note_received(&mut self, event: &FeedEvent) {
         self.stats.events += 1;
         self.clock = self.clock.max(event.received_at);
+    }
+
+    fn handle_event(&mut self, event: &FeedEvent) -> anyhow::Result<()> {
+        self.note_received(event);
         if self.forgotten.contains(&event.symbol) {
             self.stats.dropped_forgotten += 1;
             return Ok(());
@@ -699,6 +750,45 @@ mod tests {
             timer.tick().await;
         }
         assert_eq!(caught_up_from.elapsed(), Duration::ZERO);
+    }
+
+    /// A writer to a file in `dir`, with its progress.
+    fn book_writer(dir: &tempfile::TempDir) -> (BookWriter, Arc<WriterProgress>) {
+        let path = dir.path().join("audited.sbe");
+        let (requests, _) = mpsc::channel(1);
+        let config = WriterConfig::new(&path, requests);
+        let progress = Arc::new(WriterProgress::default());
+        let output = AlignedSbeWriter::create(&path, CHUNK_SIZE).unwrap();
+        let output = SbeOutput::new(output, progress.clone());
+        (BookWriter::new(output, &config), progress)
+    }
+
+    /// A snapshot of A with one bid level of `quantity` at 0.40.
+    fn book_of_a(quantity: i64) -> FeedEvent {
+        FeedEvent {
+            symbol: "A".into(),
+            received_at: DateTime::UNIX_EPOCH,
+            exchange_ts: None,
+            seq_hint: None,
+            body: FeedBody::Snapshot {
+                bids: vec![(400_000, quantity)],
+                asks: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn an_audit_that_differs_from_the_book_logs_the_differing_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut writer, progress) = book_writer(&dir);
+        let logs = crate::core::test_logs::logs_of(|| {
+            writer.handle(WriterMessage::Event(book_of_a(100))).unwrap();
+            writer.handle(WriterMessage::Audit(book_of_a(90))).unwrap();
+        });
+        let warned = logs.contains("WARN") && logs.contains("an audit snapshot differs");
+        let level = "LevelDifference { side: Buy, price: 400000, book: 100, snapshot: 90 }";
+        assert!(warned && logs.contains(level), "{logs}");
+        assert_eq!(progress.audits().mismatched, 1);
     }
 
     #[test]

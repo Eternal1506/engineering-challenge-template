@@ -5,15 +5,19 @@
 //! A primary whose task ends outside shutdown is covered by inspection
 //! only: the mock exchange has no way to end a connection's task.
 
+use tokio::time::Instant;
+
 use super::Supervisor;
 use crate::core::stats::{FailoverCause, ReplicaRole};
 
 impl Supervisor {
     /// A new primary socket's first message for each symbol is its
-    /// subscribe snapshot, so every symbol is released. The standbys start
-    /// after the primary first connects.
+    /// subscribe snapshot, so every symbol is released, and its markets'
+    /// silence counts from now. The standbys start after the primary first
+    /// connects.
     pub(super) fn on_connected(&mut self) {
         let released = self.resync.clear();
+        self.stale.restart(Instant::now());
         self.reconnect_requested = false;
         self.replicas.disarm_promotion();
         self.counters.note_connected(ReplicaRole::Primary);
@@ -69,9 +73,11 @@ impl Supervisor {
     }
 
     /// Makes replica `replica` the primary and returns the old primary. A
-    /// reconnect asked of the old primary no longer concerns the shard.
+    /// reconnect asked of the old primary no longer concerns the shard, and
+    /// the markets' silence counts afresh on the new one.
     pub(super) fn promote(&mut self, replica: usize) -> usize {
         self.reconnect_requested = false;
+        self.stale.restart(Instant::now());
         self.replicas.promote(replica)
     }
 

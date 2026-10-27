@@ -18,12 +18,16 @@
 //! Changes from the last three collect for a short window and then go to
 //! each shard as one command, so a burst of lifecycle events does not
 //! become a command per market.
+//!
+//! A shard whose connections overflow too often, as [`SplitRule`] says, is
+//! split in two (see [`split`]).
 
 mod budget;
 mod lifecycle;
 mod markets;
 mod reconcile;
 mod registry;
+mod split;
 mod timers;
 mod upkeep;
 mod walks;
@@ -44,8 +48,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::shard::{
-    self, FailoverTimings, ResyncTimings, ShardCommand, ShardContext, ShardHandle, ShardId,
-    ShardPlan,
+    self, FailoverTimings, MonitorConfig, ResyncTimings, ShardCommand, ShardContext, ShardHandle,
+    ShardId, ShardPlan, ShardReport,
 };
 use crate::core::stats::{self, Census, ChangeCause, RecorderCounters, StatsReporter};
 use crate::core::watchdog::{Heartbeat, Heartbeats};
@@ -56,9 +60,12 @@ use budget::ConnectionBudget;
 use lifecycle::LifecycleLink;
 use markets::{MarketStates, Verdict};
 use registry::{Changes, Registry, Update};
+use split::{OverflowLog, WaitingShards};
 use timers::{Tick, Timers};
 use upkeep::Upkeep;
 use walks::{WalkResult, Walks, walk_catalog};
+
+pub use split::SplitRule;
 
 /// The default most markets on one shard.
 pub const DEFAULT_SHARD_SIZE: usize = 2_000;
@@ -98,6 +105,10 @@ pub struct CoordinatorConfig {
     pub shard_event_capacity: usize,
     /// How each shard waits for the snapshots a resync asks for.
     pub resync: ResyncTimings,
+    /// How each shard watches its markets and audits its books.
+    pub monitor: MonitorConfig,
+    /// When a shard that keeps overflowing is split in two.
+    pub split: SplitRule,
     /// The time between two stats lines.
     pub stats_interval: Duration,
     /// How long shutdown waits for the shards to hand their last events to
@@ -120,6 +131,8 @@ impl Default for CoordinatorConfig {
             connection: ConnectionConfig::default(),
             shard_event_capacity: shard::DEFAULT_EVENT_CAPACITY,
             resync: ResyncTimings::default(),
+            monitor: MonitorConfig::default(),
+            split: SplitRule::default(),
             stats_interval: stats::DEFAULT_STATS_INTERVAL,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
             lifecycle: LifecycleTimings::default(),
@@ -187,9 +200,14 @@ pub struct Coordinator<E, C> {
     markets: MarketStates,
     shards: HashMap<ShardId, ShardHandle>,
     /// Shards closing because their last market was removed.
-    closing: Vec<JoinHandle<()>>,
+    closing: Vec<(ShardId, JoinHandle<()>)>,
+    /// Split shards waiting for the shard they were split from.
+    waiting: WaitingShards,
     upkeep: Upkeep<E>,
     resnapshot_requests: mpsc::Receiver<Arc<str>>,
+    /// What the shards report.
+    reports: mpsc::UnboundedReceiver<ShardReport>,
+    overflows: OverflowLog,
     stats: StatsReporter,
     startup: Startup,
     progress: Arc<WriterProgress>,
@@ -215,7 +233,7 @@ where
     /// A coordinator with no markets yet, recording `feed` through `writer`.
     pub fn new(mut feed: Feed<E, C>, writer: WriterLink, config: CoordinatorConfig) -> Self {
         let upkeep = Upkeep::new(feed.lifecycle_endpoint.take(), config.lifecycle.clone());
-        let context = shard_context(feed, writer.messages, &config);
+        let (context, reports) = shard_context(feed, writer.messages, &config);
         let counters = context.counters.clone();
         let heartbeat = context.heartbeats.register("coordinator");
         Self {
@@ -224,8 +242,11 @@ where
             markets: MarketStates::default(),
             shards: HashMap::new(),
             closing: Vec::new(),
+            waiting: WaitingShards::default(),
             upkeep,
             resnapshot_requests: writer.resnapshot_requests,
+            reports,
+            overflows: OverflowLog::new(config.split.clone()),
             stats: StatsReporter::new(counters, writer.progress.clone(), config.stats_interval),
             startup: Startup::new(),
             progress: writer.progress,
@@ -304,7 +325,8 @@ where
         self.context.cancel.cancel();
         let lifecycle = self.upkeep.link.take().map(LifecycleLink::into_task);
         let open = self.shards.drain().map(|(_, shard)| shard.close());
-        let closing = self.closing.drain(..).chain(lifecycle);
+        let closed = self.closing.drain(..).map(|(_, task)| task);
+        let closing = closed.chain(lifecycle);
         let tasks: Vec<_> = open.chain(closing).collect();
         let mut joined = pin!(join_all(tasks));
         let results = tokio::select! {
@@ -345,6 +367,7 @@ where
                 }
                 walked = walks.next() => self.on_walk(walked),
                 Some(symbol) = self.resnapshot_requests.recv() => self.route_resnapshot(symbol),
+                Some(report) = self.reports.recv() => self.on_report(report).await,
                 () = sleep_until(self.upkeep.flush_at) => self.flush().await,
                 tick = timers.next() => self.on_tick(tick),
             }
@@ -395,7 +418,10 @@ where
         }
     }
 
+    /// Samples the writer channel, logs the stats line if due, reaps the
+    /// closed shards, and logs once every shard has connected.
     fn on_sample(&mut self) {
+        self.reap_closed();
         let census = self.census();
         self.stats.sample(&self.context.writer, census);
         let up = self.context.counters.read().primaries_up;
@@ -443,10 +469,12 @@ where
     }
 
     /// Sends the registry changes collected so far: tells the writer which
-    /// markets to forget and which to track again, closes, starts and
-    /// updates shards, and asks for fresh snapshots of returning markets.
+    /// markets to forget and which to track again, closes, updates and
+    /// starts shards, and asks for fresh snapshots of returning markets.
     /// Closing first leaves the closed shards' connections out of the
-    /// budget for the new ones.
+    /// budget for the new ones, and updating before starting has a split
+    /// shard drop the markets it gives up before the new shard subscribes
+    /// them.
     async fn flush(&mut self) {
         self.upkeep.flush_at = None;
         let changes = self.registry.take_changes(Instant::now());
@@ -454,11 +482,11 @@ where
         for shard in changes.closed {
             self.close_shard(shard);
         }
-        for (shard, symbols) in changes.opened {
-            self.open_shard(shard, symbols);
-        }
         for (shard, update) in changes.updated {
             self.update_shard(shard, update);
+        }
+        for (shard, symbols) in changes.opened {
+            self.open_shard(shard, symbols);
         }
         for symbol in changes.returned {
             if let Some(shard) = self.registry.owner(&symbol) {
@@ -481,7 +509,7 @@ where
     /// The replicas a new shard gets: the configured count, or one if the
     /// open shards leave no room for more, which is counted and logged.
     fn replicas_for_new_shard(&self) -> NonZeroUsize {
-        let open = self.shards.values().map(ShardHandle::replicas).sum();
+        let open = self.open_connections();
         let replicas = self.budget.replicas_for(open);
         if self.budget.is_short(replicas) {
             self.context.counters.note_unreplicated_shard();
@@ -493,6 +521,11 @@ where
             );
         }
         replicas
+    }
+
+    /// The connections the open shards run once their standbys start.
+    fn open_connections(&self) -> usize {
+        self.shards.values().map(ShardHandle::replicas).sum()
     }
 
     /// Has the writer forget departed markets, writing their final
@@ -509,8 +542,13 @@ where
         }
     }
 
-    fn update_shard(&self, shard: ShardId, update: Update) {
+    /// Applies `update` to `shard`, or to the markets it will start with
+    /// while it waits for the shard it was split from.
+    fn update_shard(&mut self, shard: ShardId, update: Update) {
         tracing::debug!(shard = shard.0, ?update, "changing a shard's markets");
+        if self.waiting.update(shard, &update) {
+            return;
+        }
         if !update.removed.is_empty() {
             self.send_to(shard, ShardCommand::Remove(update.removed));
         }
@@ -529,30 +567,44 @@ where
         self.send_to(shard, ShardCommand::Resnapshot(symbol));
     }
 
+    /// Closes `shard`, which has no markets left, or drops it if it was a
+    /// split shard still waiting to start.
     fn close_shard(&mut self, shard: ShardId) {
+        self.overflows.forget(shard);
+        if self.waiting.cancel(shard) {
+            return;
+        }
         let Some(handle) = self.shards.remove(&shard) else {
             return;
         };
         tracing::info!(shard = shard.0, "closing a shard with no markets left");
         self.reap_closed();
-        self.closing.push(handle.close());
+        self.closing.push((shard, handle.close()));
     }
 
     /// Drops the closing shards that have finished, logging any that
-    /// panicked.
+    /// panicked, and starts any split shard still waiting for one of them:
+    /// a finished shard has delivered everything it will.
     fn reap_closed(&mut self) {
-        let (finished, running) = self
-            .closing
-            .drain(..)
-            .partition(|task: &JoinHandle<()>| task.is_finished());
+        let (finished, running) = std::mem::take(&mut self.closing)
+            .into_iter()
+            .partition(|(_, task): &(ShardId, JoinHandle<()>)| task.is_finished());
         self.closing = running;
-        let ends = finished.into_iter().filter_map(FutureExt::now_or_never);
-        ends.for_each(log_task_end);
+        for (shard, task) in finished {
+            task.now_or_never().into_iter().for_each(log_task_end);
+            self.start_waiting(shard);
+        }
     }
 
+    /// Passes `command` to `shard`. A split shard waiting to start needs
+    /// none: it subscribes its markets, with fresh snapshots, when it does.
     fn send_to(&self, shard: ShardId, command: ShardCommand) {
         match self.shards.get(&shard) {
             Some(handle) => handle.send(command),
+            None if self.waiting.holds(shard) => {
+                let shard = shard.0;
+                tracing::debug!(shard, ?command, "dropped a command for a waiting shard");
+            }
             None => tracing::warn!(shard = shard.0, ?command, "no such shard"),
         }
     }
@@ -569,25 +621,30 @@ where
 }
 
 /// The context every shard of a new coordinator shares, with the book
-/// endpoint and codec of `feed`, and fresh counters and tokens.
+/// endpoint and codec of `feed`, and fresh counters and tokens, and the
+/// receiver of the shards' reports.
 fn shard_context<E, C>(
     feed: Feed<E, C>,
     writer: mpsc::Sender<WriterMessage>,
     config: &CoordinatorConfig,
-) -> ShardContext<E, C> {
-    ShardContext {
+) -> (ShardContext<E, C>, mpsc::UnboundedReceiver<ShardReport>) {
+    let (reports, report_receiver) = mpsc::unbounded_channel();
+    let context = ShardContext {
         endpoint: Arc::new(feed.endpoint),
         codec: Arc::new(feed.codec),
         connection: config.connection.clone(),
         event_capacity: config.shard_event_capacity,
         resync: config.resync.clone(),
         failover: config.failover.clone(),
+        monitor: config.monitor.clone(),
         writer,
+        reports,
         counters: Arc::new(RecorderCounters::default()),
         cancel: CancellationToken::new(),
         abandon: CancellationToken::new(),
         heartbeats: Heartbeats::default(),
-    }
+    };
+    (context, report_receiver)
 }
 
 /// The next event of the lifecycle connection, if there is one; never

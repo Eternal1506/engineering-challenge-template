@@ -1,6 +1,8 @@
 //! Running counters shared by the recorder's tasks, and the periodic stats
 //! line built from them.
 
+mod lag;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -9,6 +11,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::core::writer::{WriterMessage, WriterProgress};
+use lag::LagHistogram;
+
+pub use lag::LagQuantiles;
 
 /// The default time between two stats lines.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(30);
@@ -46,6 +51,8 @@ pub enum FailoverCause {
     Lagging,
     /// The primary left a live market unanswered past its resync deadline.
     Resync,
+    /// The primary went silent on too many of its busy markets at once.
+    Stale,
 }
 
 /// Counts the shard tasks and the coordinator keep as they run, read by the
@@ -53,6 +60,8 @@ pub enum FailoverCause {
 #[derive(Debug, Default)]
 pub struct RecorderCounters {
     events_forwarded: AtomicU64,
+    feed_lag: LagHistogram,
+    monitoring: MonitorCounters,
     primaries_up: AtomicUsize,
     standbys_up: AtomicUsize,
     sockets: AtomicUsize,
@@ -70,6 +79,105 @@ pub struct RecorderCounters {
     added: CauseCounters,
     removed: CauseCounters,
     reconciles: AtomicU64,
+}
+
+/// The counts the shards' and the coordinator's monitoring keeps.
+#[derive(Debug, Default)]
+struct MonitorCounters {
+    resubscribes: AtomicU64,
+    stale_escalations: AtomicU64,
+    overflows: AtomicU64,
+    splits: AtomicU64,
+    splits_skipped: AtomicU64,
+    markets_watched: AtomicUsize,
+    markets_active: AtomicUsize,
+}
+
+/// One reading of the monitoring counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorCounts {
+    /// Silent markets resubscribed on their primary.
+    pub resubscribes: u64,
+    /// Checks that found so many busy markets silent at once that the
+    /// primary's socket was treated as dead.
+    pub stale_escalations: u64,
+    /// Overflow errors, on any connection of any shard.
+    pub overflows: u64,
+    /// Shards split in two after repeated overflows.
+    pub splits: u64,
+    /// Splits skipped for want of room in the connection budget.
+    pub splits_skipped: u64,
+    /// Markets busy enough over the long window to be watched for silence,
+    /// as of each shard's last check.
+    pub markets_watched: usize,
+    /// Markets busy enough over the short window, as of each shard's last
+    /// check.
+    pub markets_active: usize,
+}
+
+/// How many of one shard's markets are busy, as one check found them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MarketActivity {
+    /// Markets busy enough over the long window to be watched for silence.
+    pub watched: usize,
+    /// Markets busy enough over the short window.
+    pub active: usize,
+}
+
+/// One shard's share of the busy-market totals on the stats line. The
+/// share it shows is taken back out when it is dropped.
+#[derive(Debug)]
+pub struct ActivityGauge {
+    counters: Arc<RecorderCounters>,
+    shown: MarketActivity,
+}
+
+impl ActivityGauge {
+    /// A gauge adding to `counters`, showing nothing yet.
+    pub fn new(counters: Arc<RecorderCounters>) -> Self {
+        Self {
+            counters,
+            shown: MarketActivity::default(),
+        }
+    }
+
+    /// Shows `activity` in place of what the gauge showed before.
+    pub fn show(&mut self, activity: MarketActivity) {
+        let monitoring = &self.counters.monitoring;
+        let (before, after) = (self.shown, activity);
+        shift(&monitoring.markets_watched, before.watched, after.watched);
+        shift(&monitoring.markets_active, before.active, after.active);
+        self.shown = activity;
+    }
+}
+
+impl Drop for ActivityGauge {
+    fn drop(&mut self) {
+        self.show(MarketActivity::default());
+    }
+}
+
+/// Moves `total` by the change from `before` to `after`.
+fn shift(total: &AtomicUsize, before: usize, after: usize) {
+    if after >= before {
+        total.fetch_add(after - before, Ordering::Relaxed);
+    } else {
+        total.fetch_sub(before - after, Ordering::Relaxed);
+    }
+}
+
+impl MonitorCounters {
+    fn read(&self) -> MonitorCounts {
+        MonitorCounts {
+            resubscribes: self.resubscribes.load(Ordering::Relaxed),
+            stale_escalations: self.stale_escalations.load(Ordering::Relaxed),
+            overflows: self.overflows.load(Ordering::Relaxed),
+            splits: self.splits.load(Ordering::Relaxed),
+            splits_skipped: self.splits_skipped.load(Ordering::Relaxed),
+            markets_watched: self.markets_watched.load(Ordering::Relaxed),
+            markets_active: self.markets_active.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// One count per [`ChangeCause`].
@@ -117,6 +225,7 @@ struct FailoverCounters {
     silent: AtomicU64,
     lagging: AtomicU64,
     resync: AtomicU64,
+    stale: AtomicU64,
 }
 
 /// One reading of the failover count per [`FailoverCause`].
@@ -131,6 +240,8 @@ pub struct FailoverCounts {
     /// Failovers from a primary that left a live market unanswered past its
     /// resync deadline.
     pub resync: u64,
+    /// Failovers from a primary silent on too many busy markets at once.
+    pub stale: u64,
 }
 
 impl FailoverCounters {
@@ -140,6 +251,7 @@ impl FailoverCounters {
             FailoverCause::Silent => &self.silent,
             FailoverCause::Lagging => &self.lagging,
             FailoverCause::Resync => &self.resync,
+            FailoverCause::Stale => &self.stale,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -150,6 +262,7 @@ impl FailoverCounters {
             silent: self.silent.load(Ordering::Relaxed),
             lagging: self.lagging.load(Ordering::Relaxed),
             resync: self.resync.load(Ordering::Relaxed),
+            stale: self.stale.load(Ordering::Relaxed),
         }
     }
 }
@@ -198,12 +311,54 @@ pub struct CounterValues {
     pub removed: CauseCounts,
     /// Reconciles with the catalog that finished, failed or not.
     pub reconciles: u64,
+    /// Resubscribes, overflows, splits and busy markets.
+    pub monitoring: MonitorCounts,
 }
 
 impl RecorderCounters {
     /// One feed event went to the writer.
     pub fn note_forwarded(&self) {
         self.events_forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A level change went to the writer `lag_ms` milliseconds after the
+    /// exchange sent it.
+    pub fn note_feed_lag(&self, lag_ms: i64) {
+        self.feed_lag.note(lag_ms);
+    }
+
+    /// The feed lag quantiles since the last call, which starts them over.
+    pub fn take_feed_lag(&self) -> LagQuantiles {
+        self.feed_lag.take_quantiles()
+    }
+
+    /// `count` silent markets were resubscribed.
+    pub fn note_resubscribes(&self, count: usize) {
+        let resubscribes = &self.monitoring.resubscribes;
+        resubscribes.fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    /// A check found so many busy markets silent that the primary's socket
+    /// was treated as dead.
+    pub fn note_stale_escalation(&self) {
+        let escalations = &self.monitoring.stale_escalations;
+        escalations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection reported an overflow.
+    pub fn note_overflow(&self) {
+        self.monitoring.overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A shard was split in two.
+    pub fn note_split(&self) {
+        self.monitoring.splits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A split was skipped for want of room in the connection budget.
+    pub fn note_split_skipped(&self) {
+        let skipped = &self.monitoring.splits_skipped;
+        skipped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A connection playing `role` came up.
@@ -347,13 +502,14 @@ impl RecorderCounters {
         }
     }
 
-    /// The market lifecycle counts, every other count zero.
+    /// The market lifecycle and monitoring counts, every other count zero.
     fn read_markets(&self) -> CounterValues {
         CounterValues {
             lifecycle_events: self.lifecycle_events.load(Ordering::Relaxed),
             added: self.added.read(),
             removed: self.removed.read(),
             reconciles: self.reconciles.load(Ordering::Relaxed),
+            monitoring: self.monitoring.read(),
             ..CounterValues::default()
         }
     }
@@ -374,14 +530,18 @@ pub struct Census {
 /// Samples the writer channel's depth and logs the stats lines at info,
 /// once per interval.
 ///
-/// - `stats`: the shard count, the markets recorded and known, primaries up
+/// - `stats`: the shard count, the markets recorded and known, the markets
+///   busy over the last minute and those watched for silence, primaries up
 ///   and down, standbys up, book connections running, events forwarded per
-///   second since the last line, snapshots and updates written, and the
-///   writer channel's depth and its peak since startup.
+///   second and the median and 99th percentile feed lag since the last
+///   line, snapshots and updates written, books audited and the share that
+///   matched, and the writer channel's depth and its peak since startup.
 /// - `stats: recovery`: the totals of disconnects, failovers by
 ///   [`FailoverCause`], shards left unreplicated, resnapshot requests,
-///   gaps, resyncs (completed, overdue, reconnect requested), resync drops
-///   and held markets asked for again.
+///   gaps, resyncs (completed, overdue, reconnect requested), resync drops,
+///   held markets asked for again, silent markets resubscribed, sockets
+///   found dead by their silence, overflows, and shard splits made and
+///   skipped.
 /// - `stats: markets`: the totals of lifecycle events, markets added and
 ///   removed by each [`ChangeCause`], and reconciles.
 ///
@@ -451,20 +611,29 @@ impl StatsReporter {
         log_market_changes(&counts);
     }
 
-    /// Logs the shards, markets, connections, throughput and writer depth.
+    /// Logs the shards, markets, connections, throughput, feed lag, audits
+    /// and writer depth.
     fn log_flow(&mut self, counts: &CounterValues, depth: usize, census: Census) {
         let events_per_sec = self.events_per_second(counts.events_forwarded);
+        let lag = self.counters.take_feed_lag();
+        let audits = self.progress.audits();
         tracing::info!(
             shards = census.shards,
             markets = census.markets,
             known = census.known,
+            markets_active = counts.monitoring.markets_active,
+            markets_watched = counts.monitoring.markets_watched,
             up = counts.primaries_up,
             down = census.shards.saturating_sub(counts.primaries_up),
             standbys_up = counts.standbys_up,
             sockets = counts.sockets,
             events_per_sec,
+            feed_lag_p50_ms = lag.p50,
+            feed_lag_p99_ms = lag.p99,
             snapshots = self.progress.snapshots_written(),
             updates = self.progress.updates_written(),
+            audits = audits.total(),
+            audit_match_pct = audits.match_percent(),
             writer_depth = depth,
             writer_peak = self.peak_depth,
             "stats"
@@ -486,14 +655,17 @@ impl StatsReporter {
     }
 }
 
-/// Logs the disconnect, failover, gap, resync and resnapshot totals.
+/// Logs the disconnect, failover, gap, resync, resnapshot, resubscribe,
+/// overflow and split totals.
 fn log_recovery(counts: &CounterValues) {
+    let monitoring = &counts.monitoring;
     tracing::info!(
         disconnects = counts.disconnects,
         failovers_disconnect = counts.failovers.disconnect,
         failovers_silent = counts.failovers.silent,
         failovers_lagging = counts.failovers.lagging,
         failovers_resync = counts.failovers.resync,
+        failovers_stale = counts.failovers.stale,
         unreplicated_shards = counts.unreplicated_shards,
         resnapshots = counts.resnapshot_requests,
         gaps = counts.gaps,
@@ -502,6 +674,11 @@ fn log_recovery(counts: &CounterValues) {
         resync_reconnects = counts.resync_reconnects,
         resync_drops = counts.resync_drops,
         resync_resnapshots = counts.resync_resnapshots,
+        resubscribes = monitoring.resubscribes,
+        stale_escalations = monitoring.stale_escalations,
+        overflows = monitoring.overflows,
+        splits = monitoring.splits,
+        splits_skipped = monitoring.splits_skipped,
         "stats: recovery"
     );
 }
@@ -585,6 +762,49 @@ mod tests {
             ..CauseCounts::default()
         };
         assert_eq!((counts.added, counts.removed), (added, removed));
+    }
+
+    /// The stats lines logged with `counters` and `progress`.
+    fn stats_lines(counters: Arc<RecorderCounters>, progress: Arc<WriterProgress>) -> String {
+        let (writer, _receiver) = mpsc::channel(8);
+        let mut stats = StatsReporter::new(counters, progress, Duration::from_secs(3600));
+        crate::core::test_logs::logs_of(|| stats.log_now(&writer, Census::default()))
+    }
+
+    #[test]
+    fn the_stats_line_shows_the_audit_match_rate() {
+        let progress = Arc::new(WriterProgress::default());
+        (0..3).for_each(|_| progress.note_audit_match());
+        progress.note_audit_mismatch();
+        let logs = stats_lines(Arc::default(), progress);
+        assert!(logs.contains("audits=4 audit_match_pct=75.0"), "{logs}");
+    }
+
+    #[test]
+    fn the_stats_line_shows_the_feed_lag_since_the_last_line() {
+        let counters = Arc::new(RecorderCounters::default());
+        let lags = std::iter::repeat_n(30, 98).chain([700, 700]);
+        lags.for_each(|lag| counters.note_feed_lag(lag));
+        let logs = stats_lines(counters.clone(), Arc::default());
+        let expected = "feed_lag_p50_ms=30 feed_lag_p99_ms=672";
+        assert!(logs.contains(expected), "{logs}");
+        assert_eq!(counters.take_feed_lag(), LagQuantiles::default());
+    }
+
+    #[test]
+    fn each_shards_busy_markets_count_until_it_drops_its_gauge() {
+        let counters = Arc::new(RecorderCounters::default());
+        let busy = |watched, active| MarketActivity { watched, active };
+        let mut first = ActivityGauge::new(counters.clone());
+        let mut second = ActivityGauge::new(counters.clone());
+        first.show(busy(5, 9));
+        second.show(busy(2, 1));
+        first.show(busy(4, 3));
+        let both = counters.read().monitoring;
+        drop(second);
+        let one = counters.read().monitoring;
+        let totals = |counts: MonitorCounts| (counts.markets_watched, counts.markets_active);
+        assert_eq!((totals(both), totals(one)), ((6, 4), (4, 3)));
     }
 
     #[tokio::test]

@@ -24,6 +24,10 @@ pub(super) enum Input {
     PromotionDue,
     /// The replicas' health is due to be compared.
     HealthCheck,
+    /// The markets are due to be checked for silence.
+    StaleCheck,
+    /// An audit round is due.
+    AuditRound,
 }
 
 /// The supervisor's timers' deadlines; a timer without one never fires.
@@ -32,6 +36,8 @@ pub(super) struct Deadlines {
     pub(super) standbys: Option<Instant>,
     pub(super) promotion: Option<Instant>,
     pub(super) health: Option<Instant>,
+    pub(super) stale: Option<Instant>,
+    pub(super) audit: Option<Instant>,
 }
 
 /// What a supervisor waits on besides its replicas' events.
@@ -42,6 +48,8 @@ pub(super) struct Inputs {
     standby_timer: Timer,
     promotion_timer: Timer,
     health_timer: Timer,
+    stale_timer: Timer,
+    audit_timer: Timer,
 }
 
 impl Inputs {
@@ -52,6 +60,8 @@ impl Inputs {
             standby_timer: Timer::new(),
             promotion_timer: Timer::new(),
             health_timer: Timer::new(),
+            stale_timer: Timer::new(),
+            audit_timer: Timer::new(),
         }
     }
 
@@ -68,6 +78,8 @@ impl Inputs {
             standby_timer,
             promotion_timer,
             health_timer,
+            stale_timer,
+            audit_timer,
         } = self;
         tokio::select! {
             biased;
@@ -76,6 +88,8 @@ impl Inputs {
             () = standby_timer.wait(due.standbys) => Some(Input::StandbysDue),
             () = promotion_timer.wait(due.promotion) => Some(Input::PromotionDue),
             () = health_timer.wait(due.health) => Some(Input::HealthCheck),
+            () = stale_timer.wait(due.stale) => Some(Input::StaleCheck),
+            () = audit_timer.wait(due.audit) => Some(Input::AuditRound),
             input = replicas.next_input() => input.map(Input::Replica),
         }
     }

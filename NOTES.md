@@ -207,3 +207,6 @@ are the VM's `IpExt InOctets` (TLS and TCP included), sampled every 5 s; CPU is 
     behind its backlog plausibly pushes the exchange to drop it.
 - **A 2,000-market `get_snapshot` is rarely answered within 10 s on this link.** In that run, 88 such requests had
   markets still unanswered after 10 s, up to all 2,000.
+- **A shard split does not help overflows caused by our own writer backpressure.** When the writer falls behind, every
+  shard waits for it and stops reading its sockets, so the exchange's buffers fill on every connection alike, however
+  the markets are spread.

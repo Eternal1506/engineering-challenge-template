@@ -1,6 +1,7 @@
 //! The supervisor's side of a warm standby taking over from a primary that
 //! is still connected: on a health check that finds the primary silent or
-//! lagging, or when a market held past the resync deadline proves live.
+//! lagging, when a market held past the resync deadline proves live, or
+//! when too many busy markets go silent at once.
 
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ impl Supervisor {
     pub(super) fn on_live_held_market(&mut self, symbol: Arc<str>) {
         let now = Instant::now();
         let readings = self.replicas.readings(now);
-        let standby = self.health.resync_standby(&readings, now);
+        let standby = self.health.delivering_standby(&readings, now);
         match standby.filter(|_| !self.replicas.is_cancelled()) {
             Some(standby) => self.hand_over(standby, FailoverCause::Resync),
             None => self.resnapshot_held(symbol),
@@ -46,7 +47,7 @@ impl Supervisor {
     /// Makes the connected `standby` the primary in place of the connected
     /// primary, because of `cause`, and resyncs every symbol on it. The old
     /// primary is asked to reconnect, and does so as a standby.
-    fn hand_over(&mut self, standby: usize, cause: FailoverCause) {
+    pub(super) fn hand_over(&mut self, standby: usize, cause: FailoverCause) {
         let from = self.promote(standby);
         self.health.note_takeover(Instant::now());
         self.counters.note_failover(cause);

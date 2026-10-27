@@ -53,7 +53,7 @@ const _: () = assert!(DEFAULT_SNAPSHOT_TICK.as_millis() <= PRUNE_TICK_ALLOWANCE.
 /// take goes back to its last shard if that shard is still open and has
 /// room. Any other new market goes to the shard with the most free slots,
 /// the oldest first on a tie, and a new shard opens when every shard is
-/// full.
+/// full. Markets otherwise stay on their shard, unless it is split in two.
 ///
 /// Changes collect until [`Registry::take_changes`], which reports their net
 /// effect per shard. A shard whose last market is removed stays open, and
@@ -80,6 +80,9 @@ pub(super) struct Registry {
     /// Markets removed by an earlier take: the shard each was last on, and
     /// when.
     departed: HashMap<Arc<str>, (ShardId, Instant)>,
+    /// The most markets each shard of a split may hold, in place of the
+    /// shard size: its size right after the split.
+    capacity: HashMap<ShardId, usize>,
 }
 
 /// The net effect of the registry changes since the last take.
@@ -126,6 +129,7 @@ impl Registry {
             freed: BTreeMap::new(),
             opened: BTreeSet::new(),
             departed: HashMap::new(),
+            capacity: HashMap::new(),
         }
     }
 
@@ -157,6 +161,34 @@ impl Registry {
             symbols.remove(symbol);
         }
         true
+    }
+
+    /// Moves every other market of `shard`, in ticker order, to a new
+    /// shard, and returns the new shard with the markets moved; `None` if
+    /// `shard` has fewer than two. From then on each of the two holds at
+    /// most as many markets as it has now, so new markets do not refill the
+    /// shard that overflowed.
+    ///
+    /// The caller starts the new shard and tells `shard`: no take reports
+    /// the split. So it must come right after a take, with no change to
+    /// `shard`'s markets pending.
+    pub(super) fn split(&mut self, shard: ShardId) -> Option<(ShardId, BTreeSet<Arc<str>>)> {
+        let symbols = self.shards.get_mut(&shard)?;
+        if symbols.len() < 2 {
+            return None;
+        }
+        let moving: BTreeSet<Arc<str>> = symbols.iter().skip(1).step_by(2).cloned().collect();
+        symbols.retain(|symbol| !moving.contains(symbol));
+        let kept = symbols.len();
+        let new = ShardId(self.next_id);
+        self.next_id += 1;
+        for symbol in &moving {
+            self.owners.insert(symbol.clone(), new);
+        }
+        self.capacity.insert(shard, kept);
+        self.capacity.insert(new, moving.len());
+        self.shards.insert(new, moving.clone());
+        Some((new, moving))
     }
 
     /// The net effect of every change since the last take, made at `now`,
@@ -242,7 +274,13 @@ impl Registry {
 
     fn has_room(&self, shard: ShardId) -> bool {
         let symbols = self.shards.get(&shard);
-        symbols.is_some_and(|symbols| self.load(shard, symbols) < self.shard_size)
+        symbols.is_some_and(|symbols| self.load(shard, symbols) < self.capacity_of(shard))
+    }
+
+    /// The most markets `shard` may hold.
+    fn capacity_of(&self, shard: ShardId) -> usize {
+        let split = self.capacity.get(&shard).copied();
+        split.unwrap_or(self.shard_size)
     }
 
     /// The shard with the most free slots, or a new one if every shard is
@@ -250,7 +288,8 @@ impl Registry {
     fn shard_with_room(&mut self) -> ShardId {
         let free = |(id, symbols): (&ShardId, &BTreeSet<Arc<str>>)| {
             let load = self.load(*id, symbols);
-            (load < self.shard_size).then(|| (self.shard_size - load, Reverse(*id)))
+            let free = self.capacity_of(*id).saturating_sub(load);
+            (free > 0).then_some((free, Reverse(*id)))
         };
         let roomiest = self.shards.iter().filter_map(free).max();
         match roomiest {
@@ -311,6 +350,7 @@ impl Registry {
             .collect();
         for shard in empty {
             self.shards.remove(&shard);
+            self.capacity.remove(&shard);
             if !opened.contains(&shard) {
                 changes.closed.push(shard);
             }
@@ -664,6 +704,51 @@ mod tests {
         let retention = FORGOTTEN_RETENTION + DEPARTED_GRACE;
         let changes = departed_then_expired(retention + Duration::from_secs(1));
         assert_eq!(changes.returned, Vec::<Arc<str>>::new());
+    }
+
+    const FIVE: [&str; 5] = ["A", "B", "C", "D", "E"];
+
+    #[test]
+    fn a_split_moves_every_other_market_to_a_new_shard() {
+        let mut registry = registry_with(5, &FIVE);
+        let split = registry.split(ShardId(0));
+        let expected = [0, 1, 0, 1, 0].map(Some).to_vec();
+        let outcome = (split, owners(&registry, &FIVE));
+        assert_eq!(outcome, (Some((ShardId(1), set(&["B", "D"]))), expected));
+    }
+
+    #[test]
+    fn no_take_reports_a_split() {
+        let mut registry = registry_with(5, &FIVE);
+        registry.split(ShardId(0));
+        assert_eq!(take(&mut registry), Changes::default());
+    }
+
+    #[test]
+    fn the_shards_of_a_split_take_no_market_beyond_their_size_then() {
+        let mut registry = registry_with(5, &FIVE);
+        registry.split(ShardId(0));
+        place_all(&mut registry, &["X"]);
+        let changes = take(&mut registry);
+        let opened = vec![(ShardId(2), set(&["X"]))];
+        assert_eq!(changes.opened, opened);
+    }
+
+    #[test]
+    fn a_split_shard_takes_markets_again_up_to_its_size_after_the_split() {
+        let mut registry = registry_with(5, &FIVE);
+        registry.split(ShardId(0));
+        remove(&mut registry, "C");
+        take(&mut registry);
+        place_all(&mut registry, &["X"]);
+        assert_eq!(registry.owner("X"), Some(ShardId(0)));
+    }
+
+    #[test]
+    fn a_shard_of_one_market_is_not_split() {
+        let mut registry = registry_with(5, &["A"]);
+        let split = registry.split(ShardId(0));
+        assert_eq!((split, registry.shard_count()), (None, 1));
     }
 
     #[test]

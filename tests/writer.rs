@@ -8,12 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    ask, at, bid, feed_level, feed_snapshot, forget, run_live, run_writer, snapshot_message,
-    stamped, track, update_message,
+    Recorded, ask, at, audited, bid, feed_level, feed_snapshot, forget, read_recording, run_live,
+    run_writer, snapshot_message, stamped, track, update_message,
 };
 use engineering_challenge::Side;
 use engineering_challenge::core::events::QuantityChange::{Absolute, Delta};
-use engineering_challenge::core::writer::{CHUNK_SIZE, WriterConfig, WriterStats, spawn_writer};
+use engineering_challenge::core::writer::{
+    AuditCounts, CHUNK_SIZE, WriterConfig, WriterMessage, WriterStats, spawn_writer,
+};
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc;
 
@@ -313,4 +315,80 @@ fn an_uncreatable_output_fails_to_spawn() {
     let (requests, _receiver) = mpsc::channel(1);
     let config = WriterConfig::new("/nonexistent-directory/out.sbe", requests);
     assert!(spawn_writer(config).is_err());
+}
+
+/// Writes `messages` to `output` and returns what was recorded with how
+/// the audits came out.
+fn run_audited(
+    output: &NamedTempFile,
+    messages: Vec<WriterMessage>,
+) -> anyhow::Result<(Vec<Recorded>, AuditCounts)> {
+    let (requests, _receiver) = mpsc::channel(16);
+    let config = WriterConfig {
+        snapshot_tick: Duration::from_secs(3600),
+        ..WriterConfig::new(output.path(), requests)
+    };
+    let (sender, handle) = spawn_writer(config)?;
+    let progress = handle.progress();
+    for message in messages {
+        sender.blocking_send(message)?;
+    }
+    drop(sender);
+    handle.join()?;
+    Ok((read_recording(output.path())?, progress.audits()))
+}
+
+#[test]
+fn an_audit_snapshot_matching_the_book_writes_nothing() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let (bids, asks) = ([(400_000, 2 * UNIT), (300_000, UNIT)], [(600_000, UNIT)]);
+    let changed_bids = [(300_000, UNIT), (400_000, 3 * UNIT)];
+    let messages = vec![
+        stamped(feed_snapshot("A", &bids, &asks), 1, None),
+        stamped(feed_level("A", bid(400_000, Delta(UNIT))), 2, None),
+        audited(feed_snapshot("A", &changed_bids, &asks), 3),
+    ];
+    let (recorded, audits) = run_audited(&output, messages)?;
+    let expected = vec![
+        snapshot_message("A", (1, 1), (&bids, &asks)),
+        update_message("A", (2, 2), (Side::Buy, 400_000, 3 * UNIT)),
+    ];
+    let counts = AuditCounts {
+        matched: 1,
+        mismatched: 0,
+    };
+    assert_eq!((recorded, audits), (expected, counts));
+    Ok(())
+}
+
+#[test]
+fn an_audit_snapshot_that_differs_is_written_as_the_new_book() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let messages = vec![
+        stamped(feed_snapshot("A", &[(400_000, UNIT)], &[]), 1, None),
+        audited(feed_snapshot("A", &[(400_000, 5 * UNIT)], &[]), 2),
+        stamped(feed_level("A", bid(400_000, Delta(UNIT))), 3, None),
+    ];
+    let (recorded, audits) = run_audited(&output, messages)?;
+    let expected = vec![
+        snapshot_message("A", (1, 1), (&[(400_000, UNIT)], &[])),
+        snapshot_message("A", (2, 2), (&[(400_000, 5 * UNIT)], &[])),
+        update_message("A", (3, 3), (Side::Buy, 400_000, 6 * UNIT)),
+    ];
+    let counts = AuditCounts {
+        matched: 0,
+        mismatched: 1,
+    };
+    assert_eq!((recorded, audits), (expected, counts));
+    Ok(())
+}
+
+#[test]
+fn an_audit_snapshot_of_a_symbol_without_a_book_starts_it_uncounted() -> anyhow::Result<()> {
+    let output = NamedTempFile::new()?;
+    let messages = vec![audited(feed_snapshot("A", &[(400_000, UNIT)], &[]), 1)];
+    let (recorded, audits) = run_audited(&output, messages)?;
+    let expected = vec![snapshot_message("A", (1, 1), (&[(400_000, UNIT)], &[]))];
+    assert_eq!((recorded, audits), (expected, AuditCounts::default()));
+    Ok(())
 }

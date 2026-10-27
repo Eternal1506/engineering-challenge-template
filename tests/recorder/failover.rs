@@ -83,7 +83,12 @@ pub(super) async fn raise(shard: &mut Shard, symbol: &str) {
 }
 
 /// Answers `request` with a book for `symbol` whose 0.40 bid is `bid`.
-async fn answer_with_bid(shard: &mut Shard, request: &SentCommand, symbol: &str, bid: i64) {
+pub(super) async fn answer_with_bid(
+    shard: &mut Shard,
+    request: &SentCommand,
+    symbol: &str,
+    bid: i64,
+) {
     let seq = shard.next_seq();
     let bids = [(400_000, bid)];
     let reply = frames::book(shard.sub, seq, symbol, (&bids, ASKS));
@@ -96,12 +101,12 @@ pub(super) async fn answer(shard: &mut Shard, request: &SentCommand, symbol: &st
 }
 
 /// The book the mock exchange sent, with its 0.40 bid at `bid`.
-fn book_with_bid(bid: i64) -> Shape {
+pub(super) fn book_with_bid(bid: i64) -> Shape {
     Shape::Snapshot(vec![(400_000, bid)], ASKS.to_vec())
 }
 
 /// The 0.40 bid became `qty`.
-fn bid_at(qty: i64) -> Shape {
+pub(super) fn bid_at(qty: i64) -> Shape {
     Shape::Update(Side::Buy, 400_000, qty)
 }
 
@@ -118,7 +123,7 @@ pub(super) async fn fail_over(pair: &mut Pair) -> SentCommand {
 }
 
 /// Waits until `holds` is true, failing the test if it takes too long.
-async fn wait_until(holds: impl Fn() -> bool) {
+pub(super) async fn wait_until(holds: impl Fn() -> bool) {
     let waiting = async {
         while !holds() {
             tokio::time::sleep(Duration::from_millis(10)).await;
