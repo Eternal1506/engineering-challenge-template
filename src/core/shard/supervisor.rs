@@ -20,6 +20,7 @@ use super::resync::{Remedy, Resync};
 use super::{ShardCommand, ShardContext};
 use crate::core::events::{Decoded, FeedBody, FeedErrorKind, FeedEvent, Inbound};
 use crate::core::stats::RecorderCounters;
+use crate::core::watchdog::Heartbeat;
 use crate::core::writer::WriterMessage;
 use crate::core::ws::{ConnectionEvent, Request};
 
@@ -37,12 +38,17 @@ pub(super) struct Supervisor {
     /// Set when the shard asks its primary to reconnect, until that
     /// primary's socket is lost or a new one connects.
     reconnect_requested: bool,
+    /// Beats each turn of the loop and every second spent waiting for
+    /// input or for room at the writer.
+    heartbeat: Heartbeat,
 }
 
 impl Supervisor {
+    /// A supervisor of `replicas`, beating `heartbeat`, with no symbols
+    /// until [`Supervisor::run`].
     pub(super) fn new<E, C>(
         replicas: ReplicaSet,
-        symbols: BTreeSet<Arc<str>>,
+        heartbeat: Heartbeat,
         context: &ShardContext<E, C>,
     ) -> Self {
         Self {
@@ -50,31 +56,42 @@ impl Supervisor {
             writer: context.writer.clone(),
             counters: context.counters.clone(),
             abandon: context.abandon.clone(),
-            symbols,
+            symbols: BTreeSet::new(),
             resync: Resync::new(context.resync.clone()),
             health: HealthMonitor::new(context.failover.health.clone()),
             next_tag: 0,
             reconnect_requested: false,
+            heartbeat,
         }
     }
 
-    /// Handles commands, connection events and timers until every
-    /// connection ends or the writer is gone or abandoned, then waits for
-    /// the connection tasks. If the coordinator drops the shard's handle,
-    /// the connections shut down.
-    pub(super) async fn run(mut self, commands: mpsc::UnboundedReceiver<ShardCommand>) {
+    /// Records `symbols`, handling commands, connection events and timers
+    /// until every connection ends or the writer is gone or abandoned, then
+    /// waits for the connection tasks. If the coordinator drops the shard's
+    /// handle, the connections shut down.
+    pub(super) async fn run(
+        mut self,
+        symbols: BTreeSet<Arc<str>>,
+        commands: mpsc::UnboundedReceiver<ShardCommand>,
+    ) {
+        self.symbols = symbols;
         let mut inputs = Inputs::new(commands);
-        loop {
-            let due = self.deadlines();
-            let Some(input) = inputs.next(&mut self.replicas, due).await else {
-                break;
-            };
-            if self.on_input(input, &mut inputs).await.is_break() {
-                break;
-            }
-        }
+        while self.turn(&mut inputs).await.is_continue() {}
         drop(inputs);
         self.finish().await;
+    }
+
+    /// Waits for one input and handles it, beating at the start and every
+    /// second spent waiting for the input. Breaks once every connection has
+    /// ended or the writer is gone or abandoned.
+    async fn turn(&mut self, inputs: &mut Inputs) -> ControlFlow<()> {
+        self.heartbeat.beat();
+        let due = self.deadlines();
+        let next = inputs.next(&mut self.replicas, due);
+        let Some(input) = self.heartbeat.beat_while(next).await else {
+            return ControlFlow::Break(());
+        };
+        self.on_input(input, inputs).await
     }
 
     fn deadlines(&self) -> Deadlines {
@@ -264,13 +281,14 @@ impl Supervisor {
         }
     }
 
-    /// Sends `event` to the writer, waiting for room until the abandon token
-    /// fires. If the writer has gone or is abandoned, shuts the connections
-    /// down.
+    /// Sends `event` to the writer, waiting for room, and beating while it
+    /// waits, until the abandon token fires. If the writer has gone or is
+    /// abandoned, shuts the connections down.
     async fn forward(&mut self, event: FeedEvent) -> ControlFlow<()> {
+        let sending = self.writer.send(WriterMessage::Event(event));
         let sent = tokio::select! {
             biased;
-            sent = self.writer.send(WriterMessage::Event(event)) => sent.is_ok(),
+            sent = self.heartbeat.beat_while(sending) => sent.is_ok(),
             () = self.abandon.cancelled() => {
                 tracing::warn!("abandoned the events the writer has not taken");
                 self.replicas.cancel_all();
@@ -334,9 +352,10 @@ impl Supervisor {
         tracing::warn!(unanswered, "the resync timed out, holding the rest");
     }
 
-    /// Counts the connections that were up as down, and waits for their
-    /// tasks.
+    /// Deregisters the heartbeat, counts the connections that were up as
+    /// down, and waits for their tasks.
     async fn finish(self) {
+        drop(self.heartbeat);
         for role in self.replicas.connected_roles() {
             self.counters.note_closed(role);
         }

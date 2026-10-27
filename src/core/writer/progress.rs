@@ -86,6 +86,14 @@ impl WriterProgress {
         }
     }
 
+    /// A count that changes with every sign of the writer moving that
+    /// [`WriterProgress::stalled_for`] reads: messages written plus, where
+    /// `/proc` shows them, the writer thread's wakeups.
+    pub fn movement(&self) -> u64 {
+        let Activity { written, wakeups } = self.activity();
+        written + wakeups.unwrap_or(0)
+    }
+
     /// Counts one `Snapshot` written.
     pub(super) fn note_snapshot(&self) {
         self.snapshots_written.fetch_add(1, Ordering::Relaxed);

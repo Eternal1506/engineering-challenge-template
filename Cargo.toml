@@ -33,6 +33,11 @@ wiremock = "0.6"
 name = "writer_stdout_pipe"
 harness = false
 
+# A panic anywhere ends the process, so no task dies unnoticed; run.sh
+# restarts it. Dev and test builds unwind, since tests join panicked tasks.
+[profile.release]
+panic = "abort"
+
 [build-dependencies]
 ergo-sbe = "=0.1.16"
 indexmap = { version = "2", features = ["serde"] }

@@ -3,6 +3,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use clap::Parser;
 use engineering_challenge::cli::{Cli, Command, RecordArgs, SecretsArgs, VerifyArgs};
 use engineering_challenge::core::coordinator::{
@@ -10,6 +11,7 @@ use engineering_challenge::core::coordinator::{
 };
 use engineering_challenge::core::shard::FailoverTimings;
 use engineering_challenge::core::verify::{VerifyLimits, verify_files};
+use engineering_challenge::core::watchdog::{Watched, spawn_watchdog};
 use engineering_challenge::core::writer::{
     WriterConfig, WriterHandle, WriterProgress, spawn_writer,
 };
@@ -66,11 +68,18 @@ async fn main() -> anyhow::Result<()> {
 /// A second signal exits at once with status 130, and a shutdown in which
 /// the writer shows no sign of moving for [`SHUTDOWN_STALL_TIMEOUT`] exits
 /// with status 1; either way the output is left unfinished. A writer
-/// draining into a slow reader keeps moving.
+/// draining into a slow reader keeps moving. While recording, the watchdog
+/// aborts the process if the coordinator, a shard or the writer stops
+/// moving.
 async fn record(args: &RecordArgs) -> anyhow::Result<()> {
     let catalog = KalshiCatalog::production()?;
     let (coordinator, writer) = build_recorder(args)?;
     let cancel = CancellationToken::new();
+    spawn_watchdog(Watched {
+        heartbeats: coordinator.heartbeats(),
+        writer: writer.progress(),
+        cancel: cancel.clone(),
+    })?;
     tokio::spawn(handle_signals(cancel.clone()));
     tokio::spawn(exit_if_shutdown_stalls(cancel.clone(), writer.progress()));
     let recorded = tokio::select! {
@@ -124,13 +133,16 @@ fn coordinator_config(args: &RecordArgs) -> CoordinatorConfig {
     }
 }
 
-/// Starts the writer thread on `args.output`, returning the coordinator's
-/// link to it and the thread's handle.
+/// Starts the writer thread on `args.output`, its `{start}` filled in with
+/// the time now and the file new, returning the coordinator's link to it
+/// and the thread's handle.
 fn start_writer(args: &RecordArgs) -> anyhow::Result<(WriterLink, WriterHandle)> {
     let (requests, resnapshot_requests) = mpsc::channel::<Arc<str>>(RESNAPSHOT_QUEUE);
+    let output = args.create_output(Utc::now())?;
+    tracing::info!(output = %output.display(), "recording");
     let config = WriterConfig {
         flush_interval: args.flush_interval,
-        ..WriterConfig::new(&args.output, requests)
+        ..WriterConfig::new(&output, requests)
     };
     let (messages, writer) = spawn_writer(config)?;
     let link = WriterLink {

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# A stand-in for the recorder in run.sh's checks. Each run appends its
+# arguments to $FAKE_LOG and takes the first line off $FAKE_SCRIPT: a status
+# to exit with at once, or "wait" to log "waiting", wait up to 5 s for
+# SIGINT or SIGTERM, log each one it gets, and exit 0 shortly after the
+# first.
+
+set -u
+
+echo "run $*" >>"$FAKE_LOG"
+step=$(head -n 1 "$FAKE_SCRIPT")
+tail -n +2 "$FAKE_SCRIPT" >"$FAKE_SCRIPT.rest"
+mv "$FAKE_SCRIPT.rest" "$FAKE_SCRIPT"
+if [[ "$step" != wait ]]; then
+    exit "${step:-0}"
+fi
+
+signalled=0
+trap 'echo "got INT" >>"$FAKE_LOG"; signalled=1' INT
+trap 'echo "got TERM" >>"$FAKE_LOG"; signalled=1' TERM
+echo waiting >>"$FAKE_LOG"
+for ((polls = 0; polls < 100 && !signalled; polls++)); do
+    sleep 0.05
+done
+sleep 0.3
+exit 0

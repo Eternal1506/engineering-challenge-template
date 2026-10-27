@@ -10,6 +10,8 @@ mod mock_exchange;
 mod failover;
 #[path = "recorder/health.rs"]
 mod health;
+#[path = "recorder/heartbeats.rs"]
+mod heartbeats;
 #[path = "recorder/lifecycle.rs"]
 mod lifecycle;
 #[path = "recorder/recovery.rs"]
@@ -37,6 +39,7 @@ use engineering_challenge::core::coordinator::{
 };
 use engineering_challenge::core::shard::{FailoverTimings, ResyncTimings};
 use engineering_challenge::core::stats::RecorderCounters;
+use engineering_challenge::core::watchdog::Heartbeats;
 use engineering_challenge::core::writer::{
     WriterConfig, WriterHandle, WriterProgress, WriterStats, spawn_writer,
 };
@@ -259,6 +262,7 @@ struct Recorder {
     cancel: CancellationToken,
     task: JoinHandle<anyhow::Result<()>>,
     counters: Arc<RecorderCounters>,
+    heartbeats: Heartbeats,
     output: Output,
 }
 
@@ -295,6 +299,7 @@ impl Recorder {
             output,
         } = pipeline;
         let counters = coordinator.counters();
+        let heartbeats = coordinator.heartbeats();
         let cancel = CancellationToken::new();
         let task = tokio::spawn(coordinator.run(catalog, cancel.clone()));
         Self {
@@ -302,6 +307,7 @@ impl Recorder {
             cancel,
             task,
             counters,
+            heartbeats,
             output,
         }
     }
