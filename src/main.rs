@@ -114,6 +114,7 @@ fn coordinator_config(args: &RecordArgs) -> CoordinatorConfig {
             standby_delay: args.standby_delay,
             warmup: args.failover_warmup,
             reconnect_grace: defaults.connection.liveness_timeout,
+            ..defaults.failover.clone()
         },
         lifecycle: LifecycleTimings {
             reconcile_interval: args.reconcile_interval,

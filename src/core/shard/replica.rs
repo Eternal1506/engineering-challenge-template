@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use super::ShardContext;
-use crate::core::events::Inbound;
+use crate::core::events::{FeedBody, FeedEvent, Inbound};
+use crate::core::ws::traffic::TrafficWindow;
 use crate::core::ws::{Connection, ConnectionConfig, ConnectionEvent, Request, Subscription};
 use crate::exchange::{FeedCodec, FeedEndpoint};
 
@@ -29,7 +30,7 @@ pub(super) struct Replica {
 }
 
 /// What a supervisor has seen of one replica.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct ReplicaHealth {
     /// When the current socket connected, while it is up.
     connected_since: Option<Instant>,
@@ -37,31 +38,38 @@ pub(super) struct ReplicaHealth {
     feed_events: u64,
     /// Sequence gaps seen.
     gaps: u64,
+    /// The current socket's recent level changes and their lags. Snapshots
+    /// are left out: they come when asked for, so they say nothing about
+    /// how a socket keeps up with the market.
+    traffic: TrafficWindow,
+    /// Set when the shard asks the current socket to reconnect, until a new
+    /// socket connects.
+    reconnect_asked: bool,
 }
 
-/// Where a replica's connection runs: the token that shuts it down and its
-/// tracing span.
+/// Where a replica's connection runs: the token that shuts it down, its
+/// tracing span, and the capacity of the channel its events go through.
 struct ReplicaScope {
     cancel: CancellationToken,
     span: tracing::Span,
+    capacity: usize,
 }
 
 impl Replica {
-    /// Spawns `connection` in `scope`, delivering into a channel of
-    /// `capacity` events.
-    fn spawn<E, C>(connection: Connection<E, C>, capacity: usize, scope: ReplicaScope) -> Self
+    /// Spawns `connection` in `scope`, keeping its `health`.
+    fn spawn<E, C>(connection: Connection<E, C>, scope: ReplicaScope, health: ReplicaHealth) -> Self
     where
         E: FeedEndpoint + Send + Sync + 'static,
         C: FeedCodec + Send + Sync + 'static,
     {
         let (requests, request_receiver) = mpsc::unbounded_channel();
-        let (event_sender, events) = mpsc::channel(capacity);
+        let (event_sender, events) = mpsc::channel(scope.capacity);
         let run = connection.run(request_receiver, event_sender, scope.cancel);
         Self {
             requests,
             events,
             task: tokio::spawn(run.instrument(scope.span)),
-            health: ReplicaHealth::default(),
+            health,
             ended: false,
         }
     }
@@ -71,6 +79,18 @@ impl Replica {
         if self.requests.send(request).is_err() {
             tracing::debug!("dropped a request for a stopped connection");
         }
+    }
+
+    /// Asks the connection to drop its socket and reconnect.
+    pub(super) fn reconnect(&mut self) {
+        self.health.reconnect_asked = true;
+        self.request(Request::Reconnect);
+    }
+
+    /// Whether the replica's socket is up and is not being replaced, so it
+    /// may take over.
+    pub(super) fn is_ready(&self) -> bool {
+        self.is_connected() && !self.health.reconnect_asked
     }
 
     /// The channel the connection delivers its events into.
@@ -130,6 +150,17 @@ impl Replica {
 }
 
 impl ReplicaHealth {
+    /// Nothing seen yet; recent traffic is counted in buckets of `bucket`.
+    fn new(bucket: Duration) -> Self {
+        Self {
+            connected_since: None,
+            feed_events: 0,
+            gaps: 0,
+            traffic: TrafficWindow::new(Instant::now(), bucket),
+            reconnect_asked: false,
+        }
+    }
+
     /// Feed events delivered.
     pub(super) fn feed_events(&self) -> u64 {
         self.feed_events
@@ -140,21 +171,54 @@ impl ReplicaHealth {
         self.gaps
     }
 
+    /// The level changes the current socket delivered over the window up to
+    /// `now`.
+    pub(super) fn recent_level_changes(&self, now: Instant) -> u64 {
+        self.traffic.count(now)
+    }
+
+    /// The median feed lag of the current socket's level changes over the
+    /// window up to `now`, if any said when the exchange sent them.
+    pub(super) fn median_lag_ms(&self, now: Instant) -> Option<i64> {
+        self.traffic.median_lag_ms(now)
+    }
+
     fn observe(&mut self, event: &ConnectionEvent) {
+        let now = Instant::now();
         match event {
-            ConnectionEvent::Connected => self.connected_since = Some(Instant::now()),
+            ConnectionEvent::Connected => self.on_connected(now),
             ConnectionEvent::Disconnected { .. } => self.connected_since = None,
-            ConnectionEvent::Frame { decoded, .. } if is_feed(&decoded.message) => {
-                self.feed_events += 1;
+            ConnectionEvent::Frame { decoded, .. } => {
+                if let Inbound::Feed(event) = &decoded.message {
+                    self.note_feed(event, now);
+                }
             }
             ConnectionEvent::Gap { .. } => self.gaps += 1,
-            ConnectionEvent::Frame { .. } | ConnectionEvent::Rejected { .. } => {}
+            ConnectionEvent::Rejected { .. } => {}
         }
     }
-}
 
-fn is_feed(message: &Inbound) -> bool {
-    matches!(message, Inbound::Feed(_))
+    /// A new socket: its recent traffic is counted from `now`.
+    fn on_connected(&mut self, now: Instant) {
+        self.connected_since = Some(now);
+        self.reconnect_asked = false;
+        self.traffic.restart(now);
+    }
+
+    /// Counts feed `event`, seen at `now`. A level change also counts
+    /// towards the window, with its lag sampled: the time from the exchange
+    /// sending it to its frame arriving.
+    fn note_feed(&mut self, event: &FeedEvent, now: Instant) {
+        self.feed_events += 1;
+        if !matches!(event.body, FeedBody::Level(_)) {
+            return;
+        }
+        self.traffic.note_event(now);
+        if let Some(sent) = event.exchange_ts {
+            let lag = event.received_at - sent;
+            self.traffic.note_lag(now, lag.num_milliseconds());
+        }
+    }
 }
 
 /// Everything needed to start one of a shard's connections.
@@ -163,6 +227,9 @@ struct ConnectionRecipe<E, C> {
     codec: Arc<C>,
     config: ConnectionConfig,
     capacity: usize,
+    /// The length of the buckets each replica's recent traffic is counted
+    /// in.
+    bucket: Duration,
     /// The shard's token, the parent of each connection's.
     cancel: CancellationToken,
     /// The shard's span, the parent of each connection's.
@@ -182,8 +249,9 @@ where
         let scope = ReplicaScope {
             cancel: self.cancel.child_token(),
             span: tracing::info_span!(parent: &self.shard, "replica", index),
+            capacity: self.capacity,
         };
-        Replica::spawn(connection, self.capacity, scope)
+        Replica::spawn(connection, scope, ReplicaHealth::new(self.bucket))
     }
 }
 
@@ -214,6 +282,7 @@ impl ReplicaFactory {
             codec: context.codec.clone(),
             config: context.connection.clone(),
             capacity: context.event_capacity,
+            bucket: context.failover.health.bucket,
             cancel: cancel.clone(),
             shard,
         };
@@ -237,5 +306,34 @@ impl ReplicaFactory {
     /// Whether the shard is shutting down.
     pub(super) fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+}
+
+#[cfg(test)]
+impl ReplicaFactory {
+    /// A factory of replicas with no connection behind them, whose events
+    /// a test feeds to [`Replica::observe`] itself.
+    pub(super) fn detached() -> Self {
+        let start = |_, _| Replica::detached();
+        Self {
+            start: Box::new(start),
+            cancel: CancellationToken::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Replica {
+    /// A replica with no connection behind it; needs a tokio runtime.
+    fn detached() -> Self {
+        let (requests, _) = mpsc::unbounded_channel();
+        let (_, events) = mpsc::channel(1);
+        Self {
+            requests,
+            events,
+            task: tokio::spawn(async {}),
+            health: ReplicaHealth::new(Duration::from_secs(1)),
+            ended: false,
+        }
     }
 }

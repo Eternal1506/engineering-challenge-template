@@ -70,7 +70,7 @@ impl Supervisor {
 
     /// Makes replica `replica` the primary and returns the old primary. A
     /// reconnect asked of the old primary no longer concerns the shard.
-    fn promote(&mut self, replica: usize) -> usize {
+    pub(super) fn promote(&mut self, replica: usize) -> usize {
         self.reconnect_requested = false;
         self.replicas.promote(replica)
     }

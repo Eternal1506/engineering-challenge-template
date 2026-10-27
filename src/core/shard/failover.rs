@@ -1,6 +1,6 @@
 //! [`ReplicaSet`]: a shard's replicas, which of them is the primary, when
-//! the standbys start, which standby may take over and when, and fair
-//! intake of their events.
+//! the standbys start, which standby may take over and when, the readings
+//! the health checks compare, and fair intake of their events.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::health::{Reading, Readings};
 use super::replica::{Replica, ReplicaFactory, ReplicaHealth};
 use super::{FailoverTimings, ShardPlan};
 use crate::core::stats::ReplicaRole;
@@ -102,7 +103,12 @@ impl ReplicaSet {
 
     /// Passes `request` to the primary.
     pub(super) fn request_primary(&self, request: Request) {
-        self.replicas[self.primary].request(request);
+        self.request(self.primary, request);
+    }
+
+    /// Passes `request` to replica `index`.
+    pub(super) fn request(&self, index: usize, request: Request) {
+        self.replicas[index].request(request);
     }
 
     /// Passes `request` to every replica.
@@ -154,23 +160,63 @@ impl ReplicaSet {
     /// The standby connected the longest, if it has been connected for at
     /// least the warmup.
     pub(super) fn eligible_standby(&self) -> Option<usize> {
-        let now = Instant::now();
-        let replicas = self.replicas.iter().enumerate();
-        let standbys = replicas.filter(|&(index, _)| index != self.primary);
-        let uptimes = standbys.filter_map(|(index, replica)| Some((index, replica.uptime(now)?)));
-        let warm = uptimes.filter(|&(_, uptime)| uptime >= self.timings.warmup);
+        let warm = self.warm_standbys(Instant::now());
         let (longest, _) = warm.max_by_key(|&(_, uptime)| uptime)?;
         Some(longest)
     }
 
-    /// Sets the promotion due when the first connected standby finishes
-    /// its warmup; false if no standby is connected.
-    pub(super) fn arm_promotion(&mut self) -> bool {
+    /// Each standby connected for at least the warmup at `now`, and not
+    /// asked to reconnect, with how long it has been connected.
+    fn warm_standbys(&self, now: Instant) -> impl Iterator<Item = (usize, Duration)> + '_ {
+        let uptime = move |(index, replica): (usize, &Replica)| Some((index, replica.uptime(now)?));
+        let uptimes = self.ready_standbys().filter_map(uptime);
+        uptimes.filter(|&(_, uptime)| uptime >= self.timings.warmup)
+    }
+
+    /// Each standby whose socket is up and not asked to reconnect.
+    fn ready_standbys(&self) -> impl Iterator<Item = (usize, &Replica)> {
         let replicas = self.replicas.iter().enumerate();
-        let standbys = replicas.filter(|&(index, _)| index != self.primary);
+        let standbys = replicas.filter(move |&(index, _)| index != self.primary);
+        standbys.filter(|(_, replica)| replica.is_ready())
+    }
+
+    /// Asks replica `index` to drop its socket and reconnect. It may not
+    /// take over until its new socket connects.
+    pub(super) fn reconnect(&mut self, index: usize) {
+        self.replicas[index].reconnect();
+    }
+
+    /// The connected primary's recent traffic at `now`, and each warm
+    /// standby's.
+    pub(super) fn readings(&self, now: Instant) -> Readings {
+        let standbys = self.warm_standbys(now);
+        let readings = standbys.filter_map(|(index, _)| self.reading(index, now));
+        Readings {
+            primary: self.reading(self.primary, now),
+            standbys: readings.collect(),
+        }
+    }
+
+    /// Replica `index`'s recent traffic at `now`, while it is connected.
+    fn reading(&self, index: usize, now: Instant) -> Option<Reading> {
+        let replica = &self.replicas[index];
+        let health = replica.health();
+        Some(Reading {
+            replica: index,
+            uptime: replica.uptime(now)?,
+            level_changes: health.recent_level_changes(now),
+            median_lag_ms: health.median_lag_ms(now),
+        })
+    }
+
+    /// Sets the promotion due when the first connected standby not asked to
+    /// reconnect finishes its warmup; false if there is no such standby.
+    pub(super) fn arm_promotion(&mut self) -> bool {
+        let standbys = self.ready_standbys();
         let since = standbys.filter_map(|(_, replica)| replica.connected_since());
-        self.promotion_due = since.min().map(|since| since + self.timings.warmup);
-        self.promotion_due.is_some()
+        let due = since.min().map(|since| since + self.timings.warmup);
+        self.promotion_due = due;
+        due.is_some()
     }
 
     /// Sets the promotion due once the reconnect grace has passed: the
@@ -294,5 +340,48 @@ impl ReplicaSet {
         for replica in self.replicas {
             replica.join().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    /// A pair of detached replicas, both connected, that may take over at
+    /// once.
+    fn connected_pair() -> ReplicaSet {
+        let plan = ShardPlan {
+            symbols: BTreeSet::new(),
+            replicas: NonZeroUsize::new(2).unwrap(),
+        };
+        let timings = FailoverTimings {
+            warmup: Duration::ZERO,
+            ..FailoverTimings::default()
+        };
+        let mut replicas = ReplicaSet::start(ReplicaFactory::detached(), &plan, timings);
+        replicas.start_standbys(&BTreeSet::new());
+        replicas.observe(0, &ConnectionEvent::Connected);
+        replicas.observe(1, &ConnectionEvent::Connected);
+        replicas
+    }
+
+    /// Replica 0 hands over to 1 and is asked to reconnect; then 1 is lost
+    /// before 0's socket goes. 0 may not take over until it connects again.
+    #[tokio::test]
+    async fn a_replica_asked_to_reconnect_takes_over_only_once_connected_again() {
+        let mut replicas = connected_pair();
+        let demoted = replicas.promote(1);
+        replicas.reconnect(demoted);
+        let lost = ConnectionEvent::Disconnected {
+            reason: "lost".to_owned(),
+        };
+        replicas.observe(1, &lost);
+        let before = (replicas.eligible_standby(), replicas.arm_promotion());
+        replicas.observe(0, &lost);
+        replicas.observe(0, &ConnectionEvent::Connected);
+        let after = replicas.eligible_standby();
+        assert_eq!((before, after), ((None, false), Some(0)));
     }
 }
