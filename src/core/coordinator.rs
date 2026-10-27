@@ -19,6 +19,7 @@
 //! each shard as one command, so a burst of lifecycle events does not
 //! become a command per market.
 
+mod budget;
 mod lifecycle;
 mod markets;
 mod reconcile;
@@ -27,7 +28,8 @@ mod timers;
 mod upkeep;
 mod walks;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,11 +43,15 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::shard::{self, ShardCommand, ShardContext, ShardHandle, ShardId};
+use crate::core::shard::{
+    self, FailoverTimings, ResyncTimings, ShardCommand, ShardContext, ShardHandle, ShardId,
+    ShardPlan,
+};
 use crate::core::stats::{self, Census, ChangeCause, RecorderCounters, StatsReporter};
 use crate::core::writer::{WriterMessage, WriterProgress};
 use crate::core::ws::{ConnectionConfig, ConnectionEvent};
 use crate::exchange::{FeedCodec, FeedEndpoint, MarketCatalog, MarketInfo};
+use budget::ConnectionBudget;
 use lifecycle::LifecycleLink;
 use markets::{MarketStates, Verdict};
 use registry::{Changes, Registry, Update};
@@ -55,6 +61,14 @@ use walks::{WalkResult, Walks, walk_catalog};
 
 /// The default most markets on one shard.
 pub const DEFAULT_SHARD_SIZE: usize = 2_000;
+
+/// The default connections per shard: a primary and a standby.
+pub const DEFAULT_REPLICAS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
+/// The default most connections the recorder holds at once, below the
+/// exchange's limit of about 200 to leave room for old sockets still
+/// closing on the exchange's side.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 190;
 
 /// The default longest time shutdown waits for the shards while the writer
 /// shows no sign of moving.
@@ -69,13 +83,20 @@ const PAGE_BUFFER: usize = 4;
 pub struct CoordinatorConfig {
     /// The most markets on one shard.
     pub shard_size: usize,
+    /// The connections per shard: one primary, the rest standbys.
+    pub replicas: NonZeroUsize,
+    /// The most connections the recorder holds at once, the lifecycle
+    /// connection included. A shard whose replicas would go beyond it runs
+    /// on one connection.
+    pub max_connections: usize,
+    /// When each shard's standbys start and may take over.
+    pub failover: FailoverTimings,
     /// Timings and limits for each shard's connection.
     pub connection: ConnectionConfig,
     /// The capacity of the channel from each connection to its shard.
     pub shard_event_capacity: usize,
-    /// How long a shard waits for the snapshots a sequence gap asks for.
-    /// After that, a change to a market still waiting reconnects the shard.
-    pub resync_timeout: Duration,
+    /// How each shard waits for the snapshots a resync asks for.
+    pub resync: ResyncTimings,
     /// The time between two stats lines.
     pub stats_interval: Duration,
     /// How long shutdown waits for the shards to hand their last events to
@@ -92,9 +113,12 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             shard_size: DEFAULT_SHARD_SIZE,
+            replicas: DEFAULT_REPLICAS,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            failover: FailoverTimings::default(),
             connection: ConnectionConfig::default(),
             shard_event_capacity: shard::DEFAULT_EVENT_CAPACITY,
-            resync_timeout: shard::DEFAULT_RESYNC_TIMEOUT,
+            resync: ResyncTimings::default(),
             stats_interval: stats::DEFAULT_STATS_INTERVAL,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
             lifecycle: LifecycleTimings::default(),
@@ -169,6 +193,7 @@ pub struct Coordinator<E, C> {
     startup: Startup,
     progress: Arc<WriterProgress>,
     stall_timeout: Duration,
+    budget: ConnectionBudget,
 }
 
 /// Startup milestones, each logged once.
@@ -200,6 +225,7 @@ where
             startup: Startup::new(),
             progress: writer.progress,
             stall_timeout: config.stall_timeout,
+            budget: ConnectionBudget::new(config.replicas, config.max_connections),
         }
     }
 
@@ -359,7 +385,7 @@ where
     fn on_sample(&mut self) {
         let census = self.census();
         self.stats.sample(&self.context.writer, census);
-        let up = self.context.counters.read().connections_up;
+        let up = self.context.counters.read().primaries_up;
         let shards = census.shards;
         if self.startup.reached_all_connected(up, shards) {
             let elapsed_ms = self.startup.began.elapsed().as_millis();
@@ -404,28 +430,56 @@ where
     }
 
     /// Sends the registry changes collected so far: tells the writer which
-    /// markets to forget and which to track again, starts, updates and
-    /// closes shards, and asks for fresh snapshots of returning markets.
+    /// markets to forget and which to track again, closes, starts and
+    /// updates shards, and asks for fresh snapshots of returning markets.
+    /// Closing first leaves the closed shards' connections out of the
+    /// budget for the new ones.
     async fn flush(&mut self) {
         self.upkeep.flush_at = None;
         let changes = self.registry.take_changes(Instant::now());
         self.tell_writer(&changes).await;
+        for shard in changes.closed {
+            self.close_shard(shard);
+        }
         for (shard, symbols) in changes.opened {
-            tracing::info!(shard = shard.0, markets = symbols.len(), "opening a shard");
-            let handle = ShardHandle::spawn(shard, symbols, &self.context);
-            self.shards.insert(shard, handle);
+            self.open_shard(shard, symbols);
         }
         for (shard, update) in changes.updated {
             self.update_shard(shard, update);
-        }
-        for shard in changes.closed {
-            self.close_shard(shard);
         }
         for symbol in changes.returned {
             if let Some(shard) = self.registry.owner(&symbol) {
                 self.send_to(shard, ShardCommand::Resnapshot(symbol));
             }
         }
+    }
+
+    /// Starts `shard` on `symbols` with as many replicas as the connection
+    /// budget leaves room for.
+    fn open_shard(&mut self, shard: ShardId, symbols: BTreeSet<Arc<str>>) {
+        let replicas = self.replicas_for_new_shard();
+        let markets = symbols.len();
+        tracing::info!(shard = shard.0, markets, replicas, "opening a shard");
+        let plan = ShardPlan { symbols, replicas };
+        let handle = ShardHandle::spawn(shard, plan, &self.context);
+        self.shards.insert(shard, handle);
+    }
+
+    /// The replicas a new shard gets: the configured count, or one if the
+    /// open shards leave no room for more, which is counted and logged.
+    fn replicas_for_new_shard(&self) -> NonZeroUsize {
+        let open = self.shards.values().map(ShardHandle::replicas).sum();
+        let replicas = self.budget.replicas_for(open);
+        if self.budget.is_short(replicas) {
+            self.context.counters.note_unreplicated_shard();
+            let max_connections = self.budget.max_connections();
+            tracing::warn!(
+                open,
+                max_connections,
+                "no room for standbys, opening a lone shard"
+            );
+        }
+        replicas
     }
 
     /// Has the writer forget departed markets, writing their final
@@ -509,7 +563,8 @@ fn shard_context<E, C>(
         codec: Arc::new(feed.codec),
         connection: config.connection.clone(),
         event_capacity: config.shard_event_capacity,
-        resync_timeout: config.resync_timeout,
+        resync: config.resync.clone(),
+        failover: config.failover.clone(),
         writer,
         counters: Arc::new(RecorderCounters::default()),
         cancel: CancellationToken::new(),

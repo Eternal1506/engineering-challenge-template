@@ -8,6 +8,7 @@ use engineering_challenge::cli::{Cli, Command, RecordArgs, SecretsArgs, VerifyAr
 use engineering_challenge::core::coordinator::{
     Coordinator, CoordinatorConfig, DEFAULT_STALL_TIMEOUT, Feed, LifecycleTimings, WriterLink,
 };
+use engineering_challenge::core::shard::FailoverTimings;
 use engineering_challenge::core::verify::{VerifyLimits, verify_files};
 use engineering_challenge::core::writer::{
     WriterConfig, WriterHandle, WriterProgress, spawn_writer,
@@ -86,10 +87,6 @@ async fn record(args: &RecordArgs) -> anyhow::Result<()> {
 fn build_recorder(
     args: &RecordArgs,
 ) -> anyhow::Result<(Coordinator<KalshiEndpoint, KalshiCodec>, WriterHandle)> {
-    anyhow::ensure!(
-        args.replicas.get() == 1,
-        "only one replica per shard is supported so far"
-    );
     let credentials = load_credentials(&args.secrets)?;
     let feed = Feed {
         endpoint: kalshi_endpoint(&credentials)?,
@@ -111,6 +108,13 @@ fn coordinator_config(args: &RecordArgs) -> CoordinatorConfig {
     let defaults = CoordinatorConfig::default();
     CoordinatorConfig {
         shard_size: args.shard_size.get(),
+        replicas: args.replicas,
+        max_connections: args.max_connections.get(),
+        failover: FailoverTimings {
+            standby_delay: args.standby_delay,
+            warmup: args.failover_warmup,
+            reconnect_grace: defaults.connection.liveness_timeout,
+        },
         lifecycle: LifecycleTimings {
             reconcile_interval: args.reconcile_interval,
             ..defaults.lifecycle.clone()

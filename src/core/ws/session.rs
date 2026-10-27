@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use super::desired::Desired;
 use super::replies::{Answer, Replies};
 use super::sequence::SequenceCheck;
+use super::snapshots::SnapshotQueue;
 use super::socket::{self, Socket};
 use super::traffic::TrafficWindow;
 use super::{Channels, CommandIds, ConnectionConfig, ConnectionEvent, Request};
@@ -57,6 +58,7 @@ pub(super) struct Session<'c, C> {
     last_frame: Instant,
     silence: Pin<Box<Sleep>>,
     next_batch_at: Instant,
+    snapshots: SnapshotQueue,
     decoded: Vec<Decoded>,
     /// Recent traffic, logged if the exchange reports an overflow.
     traffic: TrafficWindow,
@@ -82,6 +84,7 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             last_frame: now,
             silence: Box::pin(tokio::time::sleep_until(now + liveness)),
             next_batch_at: now,
+            snapshots: SnapshotQueue::new(),
             decoded: Vec::new(),
             traffic: TrafficWindow::new(now),
         }
@@ -108,23 +111,23 @@ impl<'c, C: FeedCodec> Session<'c, C> {
     }
 
     /// Waits for and handles one thing: a shutdown, a request, a due
-    /// subscribe batch, a websocket message, or a timer running out.
+    /// subscribe or snapshot batch, a websocket message, or a timer running
+    /// out.
     async fn step(&mut self) -> Step {
-        let batch_due = self.batch_due();
+        let batch_at = self.batch_due().then_some(self.next_batch_at);
+        let snapshot_at = self.snapshots.due_at();
         let awaiting_name = self.sub.is_none() && self.opening_id.is_some();
+        let name_by = awaiting_name.then_some(self.name_by);
         tokio::select! {
             biased;
             () = self.parts.channels.cancel.cancelled() => Err(Stop::Shutdown),
             () = self.parts.channels.events.closed() => Err(Stop::Shutdown),
             request = self.parts.channels.requests.recv() => self.on_request(request).await,
-            () = tokio::time::sleep_until(self.next_batch_at), if batch_due => {
-                self.send_batch().await
-            }
+            () = sleep_until_some(batch_at) => self.send_batch().await,
+            () = sleep_until_some(snapshot_at) => self.send_snapshot_batch().await,
             message = self.socket.next() => self.on_message(message).await,
             () = self.silence.as_mut() => self.on_silence(),
-            () = tokio::time::sleep_until(self.name_by), if awaiting_name => Err(Stop::Lost(
-                "the exchange did not name the subscription in time".to_owned(),
-            )),
+            () = sleep_until_some(name_by) => Err(unnamed()),
         }
     }
 
@@ -139,7 +142,8 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             Request::Add(symbols) => self.parts.desired.add(symbols),
             Request::Remove(symbols) => self.parts.desired.remove(&symbols),
             Request::RequestSnapshot { tag, symbols } => {
-                return self.request_snapshot(tag, symbols).await;
+                self.request_snapshot(tag, symbols);
+                return Ok(());
             }
             Request::Reconnect => return self.reconnect(),
         }
@@ -214,15 +218,32 @@ impl<'c, C: FeedCodec> Session<'c, C> {
         self.send(build(id, symbols)).await
     }
 
-    async fn request_snapshot(&mut self, tag: u64, symbols: Vec<Arc<str>>) -> Step {
+    /// Queues the symbols of a snapshot request that this socket has asked
+    /// for, to go out in paced batches.
+    fn request_snapshot(&mut self, tag: u64, symbols: Vec<Arc<str>>) {
         let symbols = self.parts.desired.asked_for(symbols);
-        let Some(sub) = self.sub.filter(|_| !symbols.is_empty()) else {
+        if self.sub.is_none() || symbols.is_empty() {
             tracing::debug!(tag, "dropped a snapshot request with nothing to ask yet");
+            return;
+        }
+        let size = self.parts.config.snapshot_batch_size;
+        self.snapshots.push(tag, &symbols, size);
+    }
+
+    /// Sends the next queued snapshot batch, leaving out symbols removed
+    /// since it was queued.
+    async fn send_snapshot_batch(&mut self) -> Step {
+        let interval = self.parts.config.snapshot_batch_interval;
+        let (Some(sub), Some(batch)) = (self.sub, self.snapshots.pop(interval)) else {
             return Ok(());
         };
+        let symbols = self.parts.desired.asked_for(batch.symbols);
+        if symbols.is_empty() {
+            return Ok(());
+        }
         let id = self.parts.ids.next();
         let command = Command::RequestSnapshot { id, sub, symbols };
-        self.send_tagged(command, Some(tag)).await
+        self.send_tagged(command, Some(batch.tag)).await
     }
 
     async fn send(&mut self, command: Command) -> Step {
@@ -371,7 +392,8 @@ impl<'c, C: FeedCodec> Session<'c, C> {
 
     async fn name_subscription(&mut self, sub: SubId) -> Step {
         self.sub = Some(sub);
-        tracing::info!(sub = sub.0, "subscribed");
+        let local_port = socket::local_port(&self.socket);
+        tracing::info!(sub = sub.0, local_port, "subscribed");
         self.emit(ConnectionEvent::Connected).await?;
         self.sync_changes().await
     }
@@ -440,6 +462,19 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             sent = channels.events.send(event) => sent.map_err(|_| Stop::Shutdown),
         }
     }
+}
+
+/// Sleeps until `deadline`; never resolves without one.
+async fn sleep_until_some(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The loss of a socket whose subscription the exchange never named.
+fn unnamed() -> Stop {
+    Stop::Lost("the exchange did not name the subscription in time".to_owned())
 }
 
 fn is_overflow(message: &Inbound) -> bool {

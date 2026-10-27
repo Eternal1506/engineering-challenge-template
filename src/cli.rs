@@ -49,9 +49,25 @@ pub struct RecordArgs {
     #[arg(long, value_name = "N", default_value = "2000")]
     pub shard_size: NonZeroUsize,
 
-    /// Number of websocket connections per shard.
-    #[arg(long, value_name = "N", default_value = "1")]
+    /// Number of websocket connections per shard: one primary whose events
+    /// are recorded, the rest standbys ready to take over.
+    #[arg(long, value_name = "N", default_value = "2")]
     pub replicas: NonZeroUsize,
+
+    /// Most websocket connections at once, the lifecycle connection
+    /// included. A shard whose replicas would exceed it gets one.
+    #[arg(long, value_name = "N", default_value = "190")]
+    pub max_connections: NonZeroUsize,
+
+    /// How long after a shard's primary first connects its standbys start,
+    /// in seconds.
+    #[arg(long, value_name = "SECS", default_value = "30", value_parser = parse_seconds)]
+    pub standby_delay: Duration,
+
+    /// How long a standby must have been connected to take over from a
+    /// primary that disconnects, in seconds.
+    #[arg(long, value_name = "SECS", default_value = "5", value_parser = parse_seconds)]
+    pub failover_warmup: Duration,
 
     /// Flush the current output chunk this often, in seconds. Each flush
     /// pads the output to a full 64 MiB chunk.
@@ -137,7 +153,10 @@ mod tests {
         RecordArgs {
             output: PathBuf::from("/dev/stdout"),
             shard_size: NonZeroUsize::new(2000).unwrap(),
-            replicas: NonZeroUsize::new(1).unwrap(),
+            replicas: NonZeroUsize::new(2).unwrap(),
+            max_connections: NonZeroUsize::new(190).unwrap(),
+            standby_delay: Duration::from_secs(30),
+            failover_warmup: Duration::from_secs(5),
             flush_interval: None,
             reconcile_interval: Duration::from_secs(600),
             secrets: SecretsArgs {
@@ -183,6 +202,34 @@ mod tests {
     #[test]
     fn record_rejects_zero_flush_interval() {
         assert!(parse(&["record", "--flush-interval", "0"]).is_err());
+    }
+
+    #[test]
+    fn record_takes_replicas_and_their_budget_and_timings() {
+        let expected = RecordArgs {
+            replicas: NonZeroUsize::new(3).unwrap(),
+            max_connections: NonZeroUsize::new(100).unwrap(),
+            standby_delay: Duration::from_secs(10),
+            failover_warmup: Duration::from_secs(2),
+            ..default_record_args()
+        };
+        let args = [
+            "record",
+            "--replicas",
+            "3",
+            "--max-connections",
+            "100",
+            "--standby-delay",
+            "10",
+            "--failover-warmup",
+            "2",
+        ];
+        assert_eq!(parse(&args).unwrap(), Command::Record(expected));
+    }
+
+    #[test]
+    fn record_rejects_zero_replicas() {
+        assert!(parse(&["record", "--replicas", "0"]).is_err());
     }
 
     #[test]

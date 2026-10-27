@@ -174,3 +174,36 @@ no credentials or headers. The files are:
 - `event_lifecycle`;
 - `lifecycle_created`, `lifecycle_deactivated`, `lifecycle_close_date_updated`, `lifecycle_determined` and
   `lifecycle_settled`.
+
+## Replica capacity (2026-10-26)
+
+Two 6-minute live runs of the full recorder on the laptop's WSL, one after the other: one connection per shard (R=1),
+then a primary and a standby per shard (R=2). Both recorded about 152,500 markets on 77 shards of 2,000. Received bytes
+are the VM's `IpExt InOctets` (TLS and TCP included), sampled every 5 s; CPU is the process's share of one core.
+
+- **The link carries about 9 MB/s at most.** Received bytes stay flat when R doubles the subscriptions, so R=2 gives
+  each socket about half the bandwidth, and the primaries forward about half the events.
+- **CPU is not the limit:** about 82% of one core in both runs, on a 10-core machine.
+
+| | R=1 | R=2 |
+|---|---|---|
+| Received, steady state | 8.1 MB/s average, 9.3 MB/s peak | 8.8 MB/s average, 10.2 MB/s peak |
+| Events forwarded per second | about 25,000 | about 13,000 |
+| Book connections | 77 | 154 |
+| Disconnects | 9 (about 90 an hour) | 46 (about 460 an hour) |
+| Disconnect reasons | 6 overflows, 2 resets, 1 "delivery exceeded 15 seconds" | 37 resets, 5 normal closes, 4 "delivery exceeded 15 seconds" |
+| Failovers | 0 | 27 (17 on a disconnect, 10 to a standby that connected first) |
+| Peak writer channel depth | 2,524 | 1,680 |
+| `verify` | clean | clean |
+
+- **Overflows** came from hot shards whose median feed lag had reached 22–45 s.
+- **A large `get_snapshot` to a promoted standby is followed by a reset of that socket.**
+  - In an earlier 10-minute R=2 run, each failover asked the standby for all 2,000 markets in one command. 26 of 81
+    promoted sockets were reset by the peer within 5 s of that request, 0.5–2.3 s after it. A socket's chance of an
+    unrelated reset in any 5 s window was about 0.3% in that run.
+  - Asking in batches of 200 markets every 100 ms does not stop it: 11 of 17 promoted sockets were still reset,
+    0.5–1.1 s after promotion, while the batches were going out, 3 of them on a write.
+  - The standby of a hot shard is itself tens of seconds behind on this link, so a burst of snapshot replies queued
+    behind its backlog plausibly pushes the exchange to drop it.
+- **A 2,000-market `get_snapshot` is rarely answered within 10 s on this link.** In that run, 88 such requests had
+  markets still unanswered after 10 s, up to all 2,000.

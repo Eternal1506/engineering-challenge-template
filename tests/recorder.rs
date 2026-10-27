@@ -6,6 +6,8 @@ mod common;
 #[path = "mock_exchange/mod.rs"]
 mod mock_exchange;
 
+#[path = "recorder/failover.rs"]
+mod failover;
 #[path = "recorder/lifecycle.rs"]
 mod lifecycle;
 #[path = "recorder/recovery.rs"]
@@ -18,7 +20,10 @@ mod sharding;
 mod shutdown;
 #[path = "recorder/stalls.rs"]
 mod stalls;
+#[path = "recorder/takeover.rs"]
+mod takeover;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +31,9 @@ use std::time::Duration;
 use common::{Levels, Recorded, read_recording, snapshot_sides, verify_clean};
 use engineering_challenge::Side;
 use engineering_challenge::core::coordinator::{
-    Coordinator, CoordinatorConfig, Feed, LifecycleTimings, WriterLink,
+    Coordinator, CoordinatorConfig, DEFAULT_MAX_CONNECTIONS, Feed, LifecycleTimings, WriterLink,
 };
+use engineering_challenge::core::shard::{FailoverTimings, ResyncTimings};
 use engineering_challenge::core::stats::RecorderCounters;
 use engineering_challenge::core::writer::{
     WriterConfig, WriterHandle, WriterProgress, WriterStats, spawn_writer,
@@ -49,19 +55,29 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const BIDS: &[(i64, i64)] = &[(400_000, 100)];
 const ASKS: &[(i64, i64)] = &[(600_000, 50)];
 
-/// A coordinator with shards of `shard_size`, quick reconnects, no stats
-/// line during a test, subscription changes batched for 100 ms, a sweep
-/// every 100 ms and no reconcile within a test.
+/// A coordinator with shards of `shard_size` on one connection each, quick
+/// reconnects, no stats line during a test, subscription changes batched
+/// for 100 ms, a sweep every 100 ms and no reconcile within a test.
 fn config(shard_size: usize) -> CoordinatorConfig {
     CoordinatorConfig {
         shard_size,
+        replicas: NonZeroUsize::MIN,
+        max_connections: DEFAULT_MAX_CONNECTIONS,
+        failover: FailoverTimings {
+            standby_delay: Duration::ZERO,
+            warmup: Duration::ZERO,
+            ..FailoverTimings::default()
+        },
         connection: ConnectionConfig {
             backoff_min: Duration::from_millis(50),
             backoff_max: Duration::from_millis(200),
             ..ConnectionConfig::default()
         },
         shard_event_capacity: 1024,
-        resync_timeout: Duration::from_secs(5),
+        resync: ResyncTimings {
+            timeout: Duration::from_secs(5),
+            ..ResyncTimings::default()
+        },
         stats_interval: Duration::from_secs(3600),
         stall_timeout: Duration::from_secs(2),
         lifecycle: LifecycleTimings {

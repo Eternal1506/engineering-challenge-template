@@ -40,6 +40,7 @@ mod desired;
 mod replies;
 mod sequence;
 mod session;
+mod snapshots;
 mod socket;
 mod traffic;
 
@@ -77,9 +78,12 @@ pub enum Request {
     Remove(Vec<Arc<str>>),
     /// Ask for fresh snapshots of the symbols already subscribed on the
     /// current socket; the others are left out, since their subscribe brings
-    /// a snapshot anyway. The replies arrive as [`ConnectionEvent::Frame`]s
-    /// carrying `tag`. Dropped while the socket is down or its subscription
-    /// not yet named.
+    /// a snapshot anyway. The request goes out as commands of at most
+    /// [`ConnectionConfig::snapshot_batch_size`] symbols, spaced by
+    /// [`ConnectionConfig::snapshot_batch_interval`], behind any earlier
+    /// request's. The replies arrive as [`ConnectionEvent::Frame`]s carrying
+    /// `tag`. Dropped while the socket is down or its subscription not yet
+    /// named; batches not yet sent are dropped with the socket.
     ///
     /// Tagging is best effort: a reply that comes more than
     /// [`ConnectionConfig::reply_timeout`] after the request, or on a later
@@ -155,6 +159,10 @@ pub struct ConnectionConfig {
     pub subscribe_batch_size: usize,
     /// The pause between `Subscribe` commands.
     pub subscribe_batch_interval: Duration,
+    /// The most symbols in one `RequestSnapshot` command.
+    pub snapshot_batch_size: usize,
+    /// The pause between `RequestSnapshot` commands.
+    pub snapshot_batch_interval: Duration,
     /// How long to keep waiting for a command's replies.
     pub reply_timeout: Duration,
     /// How long a clean close on shutdown may take.
@@ -170,6 +178,8 @@ impl Default for ConnectionConfig {
             backoff_reset_after: Duration::from_secs(60),
             subscribe_batch_size: 500,
             subscribe_batch_interval: Duration::from_millis(100),
+            snapshot_batch_size: 200,
+            snapshot_batch_interval: Duration::from_millis(100),
             reply_timeout: Duration::from_secs(30),
             close_timeout: Duration::from_secs(2),
         }
