@@ -14,7 +14,7 @@ use super::replies::{Answer, Replies};
 use super::sequence::SequenceCheck;
 use super::snapshots::SnapshotQueue;
 use super::socket::{self, Socket};
-use super::traffic::TrafficWindow;
+use super::traffic::{DIAGNOSTIC_BUCKET, TrafficWindow};
 use super::{Channels, CommandIds, ConnectionConfig, ConnectionEvent, Request};
 use crate::core::events::{Command, Decoded, FeedErrorKind, Inbound, SubId};
 use crate::exchange::FeedCodec;
@@ -86,7 +86,7 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             next_batch_at: now,
             snapshots: SnapshotQueue::new(),
             decoded: Vec::new(),
-            traffic: TrafficWindow::new(now),
+            traffic: TrafficWindow::new(now, DIAGNOSTIC_BUCKET),
         }
     }
 

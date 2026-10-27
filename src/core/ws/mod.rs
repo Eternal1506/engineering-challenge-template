@@ -42,7 +42,7 @@ mod sequence;
 mod session;
 mod snapshots;
 mod socket;
-mod traffic;
+pub(crate) mod traffic;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

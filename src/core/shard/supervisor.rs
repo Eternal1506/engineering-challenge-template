@@ -1,6 +1,8 @@
 //! [`Supervisor`]: the task between a shard's connections and the writer.
-//! Its replica roles and failovers are in [`roles`].
+//! Its replica roles and failovers are in [`roles`], and its takeovers from
+//! a connected primary in [`handover`].
 
+mod handover;
 mod roles;
 
 use std::collections::BTreeSet;
@@ -12,6 +14,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::failover::{ReplicaInput, ReplicaSet};
+use super::health::HealthMonitor;
 use super::inputs::{Deadlines, Input, Inputs};
 use super::resync::{Remedy, Resync};
 use super::{ShardCommand, ShardContext};
@@ -29,6 +32,7 @@ pub(super) struct Supervisor {
     /// The symbols the shard records.
     symbols: BTreeSet<Arc<str>>,
     resync: Resync,
+    health: HealthMonitor,
     next_tag: u64,
     /// Set when the shard asks its primary to reconnect, until that
     /// primary's socket is lost or a new one connects.
@@ -48,6 +52,7 @@ impl Supervisor {
             abandon: context.abandon.clone(),
             symbols,
             resync: Resync::new(context.resync.clone()),
+            health: HealthMonitor::new(context.failover.health.clone()),
             next_tag: 0,
             reconnect_requested: false,
         }
@@ -77,6 +82,7 @@ impl Supervisor {
             resync: self.resync.deadline(),
             standbys: self.replicas.standbys_due(),
             promotion: self.replicas.promotion_due(),
+            health: self.health_check_due(),
         }
     }
 
@@ -91,6 +97,7 @@ impl Supervisor {
             Input::ResyncDeadline => return self.on_resync_deadline().await,
             Input::StandbysDue => self.start_standbys(),
             Input::PromotionDue => self.on_promotion_due(),
+            Input::HealthCheck => self.on_health_check(),
         }
         ControlFlow::Continue(())
     }
@@ -218,16 +225,16 @@ impl Supervisor {
     }
 
     /// Drops a level change of `symbol`, which is held back. A change after
-    /// the deadline shows the market is live yet still unanswered, so its
-    /// snapshot is asked for again or, once the resync has gone on too
-    /// long, the primary reconnects: the new socket's subscribe snapshots
-    /// are the sure way to fresh books.
+    /// the deadline shows the market is live yet still unanswered, so a
+    /// standby takes over or its snapshot is asked for again or, once the
+    /// resync has gone on too long, the primary reconnects: the new
+    /// socket's subscribe snapshots are the sure way to fresh books.
     fn drop_held_change(&mut self, symbol: &Arc<str>) {
         self.counters.note_resync_drop();
         let primary_for = self.replicas.primary_for();
         match self.resync.remedy(symbol, primary_for) {
             Remedy::Wait => {}
-            Remedy::Resnapshot => self.resnapshot_held(symbol.clone()),
+            Remedy::Resnapshot => self.on_live_held_market(symbol.clone()),
             Remedy::NewSocket => self.reconnect_primary(symbol),
         }
     }

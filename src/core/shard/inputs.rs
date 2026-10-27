@@ -22,6 +22,8 @@ pub(super) enum Input {
     StandbysDue,
     /// A standby has warmed up while the primary is down.
     PromotionDue,
+    /// The replicas' health is due to be compared.
+    HealthCheck,
 }
 
 /// The supervisor's timers' deadlines; a timer without one never fires.
@@ -29,6 +31,7 @@ pub(super) struct Deadlines {
     pub(super) resync: Option<Instant>,
     pub(super) standbys: Option<Instant>,
     pub(super) promotion: Option<Instant>,
+    pub(super) health: Option<Instant>,
 }
 
 /// What a supervisor waits on besides its replicas' events.
@@ -38,6 +41,7 @@ pub(super) struct Inputs {
     resync_timer: Timer,
     standby_timer: Timer,
     promotion_timer: Timer,
+    health_timer: Timer,
 }
 
 impl Inputs {
@@ -47,6 +51,7 @@ impl Inputs {
             resync_timer: Timer::new(),
             standby_timer: Timer::new(),
             promotion_timer: Timer::new(),
+            health_timer: Timer::new(),
         }
     }
 
@@ -62,6 +67,7 @@ impl Inputs {
             resync_timer,
             standby_timer,
             promotion_timer,
+            health_timer,
         } = self;
         tokio::select! {
             biased;
@@ -69,6 +75,7 @@ impl Inputs {
             () = resync_timer.wait(due.resync) => Some(Input::ResyncDeadline),
             () = standby_timer.wait(due.standbys) => Some(Input::StandbysDue),
             () = promotion_timer.wait(due.promotion) => Some(Input::PromotionDue),
+            () = health_timer.wait(due.health) => Some(Input::HealthCheck),
             input = replicas.next_input() => input.map(Input::Replica),
         }
     }

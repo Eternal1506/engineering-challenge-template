@@ -10,6 +10,8 @@
 //!   a snapshot request;
 //! - `delta`: `sub`, `seq`, `symbol`, `price`, `qty` (a signed change), and
 //!   optional `side`, `"buy"` (the default) or `"sell"`;
+//! - `snapshot` and `delta` also take an optional `ts`, in Unix
+//!   milliseconds, as their exchange time;
 //! - `error`: `code` (25 is an overflow), and optionally `sub`, `reply_to`;
 //! - `lifecycle`: `sub`, `seq`, `symbol`, `event` (`created`, `activated`,
 //!   `deactivated`, `close_changed`, `determined` or `settled`), and
@@ -105,6 +107,7 @@ struct Frame {
     event: Option<String>,
     open_ts: Option<i64>,
     close_ts: Option<i64>,
+    ts: Option<i64>,
 }
 
 impl Frame {
@@ -167,7 +170,7 @@ impl Frame {
         Ok(FeedEvent {
             symbol: symbol.into(),
             received_at,
-            exchange_ts: None,
+            exchange_ts: millis(self.ts),
             seq_hint: None,
             body,
         })
@@ -270,6 +273,13 @@ pub mod frames {
     pub fn level(sub: u64, seq: u64, symbol: &str, change: (&str, i64, i64)) -> Value {
         let (side, price, qty) = change;
         json!({ "kind": "delta", "sub": sub, "seq": seq, "symbol": symbol, "side": side, "price": price, "qty": qty })
+    }
+
+    /// Book `frame`, a snapshot or delta, stamped with exchange time `ts`,
+    /// in Unix milliseconds.
+    pub fn stamped(mut frame: Value, ts: i64) -> Value {
+        frame["ts"] = ts.into();
+        frame
     }
 
     /// An error with `code`, not in reply to any command.

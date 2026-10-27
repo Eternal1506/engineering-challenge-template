@@ -40,6 +40,12 @@ pub enum ReplicaRole {
 pub enum FailoverCause {
     /// The primary's socket was lost.
     Disconnect,
+    /// The primary delivered nothing while a standby kept delivering.
+    Silent,
+    /// The primary's feed lagged a standby's.
+    Lagging,
+    /// The primary left a live market unanswered past its resync deadline.
+    Resync,
 }
 
 /// Counts the shard tasks and the coordinator keep as they run, read by the
@@ -51,7 +57,7 @@ pub struct RecorderCounters {
     standbys_up: AtomicUsize,
     sockets: AtomicUsize,
     disconnects: AtomicU64,
-    failovers_on_disconnect: AtomicU64,
+    failovers: FailoverCounters,
     unreplicated_shards: AtomicU64,
     gaps: AtomicU64,
     resyncs_completed: AtomicU64,
@@ -104,11 +110,48 @@ impl CauseCounters {
     }
 }
 
+/// One failover count per [`FailoverCause`].
+#[derive(Debug, Default)]
+struct FailoverCounters {
+    disconnect: AtomicU64,
+    silent: AtomicU64,
+    lagging: AtomicU64,
+    resync: AtomicU64,
+}
+
 /// One reading of the failover count per [`FailoverCause`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FailoverCounts {
     /// Failovers from a primary whose socket was lost.
     pub disconnect: u64,
+    /// Failovers from a primary that went silent while a standby did not.
+    pub silent: u64,
+    /// Failovers from a primary whose feed lagged a standby's.
+    pub lagging: u64,
+    /// Failovers from a primary that left a live market unanswered past its
+    /// resync deadline.
+    pub resync: u64,
+}
+
+impl FailoverCounters {
+    fn note(&self, cause: FailoverCause) {
+        let counter = match cause {
+            FailoverCause::Disconnect => &self.disconnect,
+            FailoverCause::Silent => &self.silent,
+            FailoverCause::Lagging => &self.lagging,
+            FailoverCause::Resync => &self.resync,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> FailoverCounts {
+        FailoverCounts {
+            disconnect: self.disconnect.load(Ordering::Relaxed),
+            silent: self.silent.load(Ordering::Relaxed),
+            lagging: self.lagging.load(Ordering::Relaxed),
+            resync: self.resync.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// One reading of every [`RecorderCounters`] count.
@@ -179,20 +222,17 @@ impl RecorderCounters {
         self.up(role).fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// A connected standby became its shard's primary because of `cause`.
+    /// A connected standby became its shard's primary, in place of one that
+    /// was down, because of `cause`.
     pub fn note_promoted(&self, cause: FailoverCause) {
         self.note_failover(cause);
         self.note_closed(ReplicaRole::Standby);
         self.note_connected(ReplicaRole::Primary);
     }
 
-    /// A standby took over from a primary that was down because of
-    /// `cause`.
+    /// A standby took over from the primary because of `cause`.
     pub fn note_failover(&self, cause: FailoverCause) {
-        let counter = match cause {
-            FailoverCause::Disconnect => &self.failovers_on_disconnect,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+        self.failovers.note(cause);
     }
 
     /// A shard started a book connection.
@@ -287,9 +327,7 @@ impl RecorderCounters {
             standbys_up: self.standbys_up.load(Ordering::Relaxed),
             sockets: self.sockets.load(Ordering::Relaxed),
             disconnects: self.disconnects.load(Ordering::Relaxed),
-            failovers: FailoverCounts {
-                disconnect: self.failovers_on_disconnect.load(Ordering::Relaxed),
-            },
+            failovers: self.failovers.read(),
             unreplicated_shards: self.unreplicated_shards.load(Ordering::Relaxed),
             ..values
         }
@@ -453,6 +491,9 @@ fn log_recovery(counts: &CounterValues) {
     tracing::info!(
         disconnects = counts.disconnects,
         failovers_disconnect = counts.failovers.disconnect,
+        failovers_silent = counts.failovers.silent,
+        failovers_lagging = counts.failovers.lagging,
+        failovers_resync = counts.failovers.resync,
         unreplicated_shards = counts.unreplicated_shards,
         resnapshots = counts.resnapshot_requests,
         gaps = counts.gaps,
@@ -512,6 +553,20 @@ mod tests {
         let counts = counters.read();
         let up = (counts.primaries_up, counts.standbys_up);
         assert_eq!((up, counts.failovers.disconnect), ((1, 0), 1));
+    }
+
+    #[test]
+    fn failovers_are_counted_by_cause() {
+        let counters = RecorderCounters::default();
+        counters.note_failover(FailoverCause::Silent);
+        counters.note_failover(FailoverCause::Resync);
+        counters.note_failover(FailoverCause::Resync);
+        let expected = FailoverCounts {
+            silent: 1,
+            resync: 2,
+            ..FailoverCounts::default()
+        };
+        assert_eq!(counters.read().failovers, expected);
     }
 
     #[test]

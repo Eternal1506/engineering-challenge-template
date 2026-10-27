@@ -8,6 +8,8 @@ mod mock_exchange;
 
 #[path = "recorder/failover.rs"]
 mod failover;
+#[path = "recorder/health.rs"]
+mod health;
 #[path = "recorder/lifecycle.rs"]
 mod lifecycle;
 #[path = "recorder/recovery.rs"]

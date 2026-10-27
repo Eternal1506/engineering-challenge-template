@@ -147,6 +147,26 @@ impl MockClient {
         self.socket.send(Message::text(text)).await.unwrap();
     }
 
+    /// Sends `frame` unprompted, failing if the client has gone.
+    pub async fn try_send(&mut self, frame: Value) -> Result<(), tungstenite::Error> {
+        self.socket.send(Message::text(frame.to_string())).await
+    }
+
+    /// Waits for the client to drop the connection, with or without a close
+    /// frame, skipping whatever it sends before.
+    pub async fn expect_gone(&mut self) {
+        let gone = async {
+            while let Some(Ok(message)) = self.socket.next().await {
+                if message.is_close() {
+                    break;
+                }
+            }
+        };
+        timeout(STEP_TIMEOUT, gone)
+            .await
+            .expect("the client did not go in time");
+    }
+
     /// Sends a ping; fails once the client has gone.
     pub async fn ping(&mut self) -> Result<(), tungstenite::Error> {
         self.socket.send(Message::Ping(Default::default())).await

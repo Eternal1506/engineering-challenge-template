@@ -1,6 +1,7 @@
-//! When a shard's standbys start, and when one takes over: after the
-//! warmup, during a gap resync, and never when the shard itself reconnected
-//! its primary. Also the resync deadline's drain on a paired shard.
+//! When a shard's standbys start, and when one takes over from a lost
+//! primary: after the warmup, during a gap resync, and never when the shard
+//! itself reconnected its primary. Also the resync deadline's drain on a
+//! paired shard.
 
 use engineering_challenge::core::shard::ResyncTimings;
 use engineering_challenge::exchange::MarketStatus;
