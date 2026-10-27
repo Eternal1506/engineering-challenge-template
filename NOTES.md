@@ -241,3 +241,36 @@ same build with the default flipped. A 2-minute R=2 run on yawc 0.5.0 at 05:35 U
   closed markets, and recorded fewer events.
 - **No run lost a socket**, so these 3-minute runs say nothing about the R=2 disconnect rate on a saturated link
   (about 460 an hour above). That needs a longer run at a busy hour.
+
+## One-hour soak of the base recorder (2026-10-26)
+
+One connection per shard, no compression (the build of the base recorder: lifecycle, sweep, reconcile and per-symbol
+resync, before replicas), recording to a file for 3,600 s from 23:38:57 UTC, stopped by SIGINT.
+
+- **`verify`: no violations** over 155,662 symbols, 9,174,620 snapshots and 73,292,517 updates (8.3 GB), exit 0.
+- **Writer:** `dropped_before_snapshot` 0, `inconsistent` 0, `resnapshot_requests_dropped` 0. The channel's depth was 0
+  at the median 30 s sample and 71 at the 95th percentile; its peak was 13,305 of 262,144 (5.1%), a burst while five
+  shards reconnected within 5 s, drained by the next sample.
+- **50 disconnects in the hour, all recovered** by a reconnect and resubscribe within 1–3 s, with 0 sequence gaps:
+  17 overflows (error 25), 9 "delivery exceeded 15 seconds" closes, 18 resets without a closing handshake, 2 TCP resets
+  and 4 plain closes. They cluster on the shards holding the 15-minute crypto series, with 30–45 s of feed lag in the
+  overflow diagnostics, so the exchange cuts off sockets that fall behind; the writer was not the bottleneck.
+- **Lifecycle:** 11,927 events; the sweep removed 3,015 markets at their close time and the reconcile added 3,187.
+- **16,386 events were dropped for markets already removed**, about 4.6 per removal and 0.02% of all events: late
+  messages after a market's final snapshot. Measured from the recording, trading on markets past their close time stops
+  about 2 s after it, and the sweep removes them about 8 s after; 30 removed markets checked against REST were all
+  determined or finalized.
+
+## Final run of the full recorder (2026-10-27)
+
+The submitted build at its defaults (R=2, permessage-deflate, monitoring and audits on), recording to a file for
+900 s from 05:49:18 UTC, stopped by SIGINT.
+
+- **`verify`: no violations** over 147,061 symbols, 2,304,019 snapshots and 8,046,696 updates (1.3 GB), exit 0.
+- **74 shards, 148 sockets, all up the whole run:** 0 disconnects, 0 failovers, 0 gaps, 0 overflows, 0 splits.
+- **Feed lag** p50 about 225 ms, p99 320–400 ms; writer peak 3,419 of 262,144.
+- **Audits:** 5,180 snapshots compared with the books, 100.0% matched.
+- **Lifecycle:** 6,182 events; the sweep removed 3,035 markets at 06:00 UTC and added 77; the reconcile added 22.
+  3 markets that went stale were resubscribed.
+- **SIGINT:** every socket sent its close frame and the recorder exited 0. The only warnings were 34 HTTP 429 retries
+  on the REST listing at startup.
