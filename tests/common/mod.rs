@@ -109,6 +109,15 @@ pub fn stamped(event: FeedEvent, received: i64, exchange: Option<i64>) -> Writer
     })
 }
 
+/// `event`, an audit's reply received at `at(received)`, for the writer to
+/// compare with its book.
+pub fn audited(event: FeedEvent, received: i64) -> WriterMessage {
+    WriterMessage::Audit(FeedEvent {
+        received_at: at(received),
+        ..event
+    })
+}
+
 /// A `Snapshot` message with the given sides, best first.
 pub fn snapshot_message(symbol: &str, times: (i64, i64), sides: (&[Level], &[Level])) -> Recorded {
     Recorded::Snapshot(SnapshotDomain {

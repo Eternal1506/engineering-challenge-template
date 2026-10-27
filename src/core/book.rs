@@ -1,7 +1,7 @@
 //! [`Book`] holds one market's price levels and turns feed changes into the
 //! absolute level quantities the recorder writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 
@@ -24,6 +24,19 @@ pub struct Book {
     asks: BTreeMap<i64, i64>,
     last_exchange_ts: Option<DateTime<Utc>>,
     needs_resnapshot: bool,
+}
+
+/// One price level on which a [`Book`] and a snapshot of it disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelDifference {
+    /// The level's side.
+    pub side: Side,
+    /// The level's price, in fixed point.
+    pub price: i64,
+    /// The book's quantity at the level, `0` if it has none.
+    pub book: i64,
+    /// The snapshot's quantity at the level, `0` if it has none.
+    pub snapshot: i64,
 }
 
 /// The outcome of applying one level change to a [`Book`].
@@ -81,6 +94,20 @@ impl Book {
         self.asks = positive_levels(asks);
         self.last_exchange_ts = self.last_exchange_ts.max(exchange_ts);
         self.needs_resnapshot = false;
+    }
+
+    /// The levels on which the book differs from a snapshot of `bids` and
+    /// `asks`, read the way [`replace`](Self::replace) reads them, bids
+    /// first and each side by price; empty if they agree.
+    pub fn differences(
+        &self,
+        bids: impl IntoIterator<Item = (i64, i64)>,
+        asks: impl IntoIterator<Item = (i64, i64)>,
+    ) -> Vec<LevelDifference> {
+        let (bids, asks) = (positive_levels(bids), positive_levels(asks));
+        let mut found = side_differences(Side::Buy, &self.bids, &bids);
+        found.extend(side_differences(Side::Sell, &self.asks, &asks));
+        found
     }
 
     /// Whether a change left the book inconsistent with the exchange, so it
@@ -146,6 +173,25 @@ fn resulting_quantity(current: i64, change: QuantityChange) -> Option<i64> {
         QuantityChange::Delta(delta) => current.checked_add(delta),
     };
     quantity.filter(|&quantity| quantity >= 0)
+}
+
+/// The prices, in order, at which one side of a book and of a snapshot
+/// hold different quantities.
+fn side_differences(
+    side: Side,
+    book: &BTreeMap<i64, i64>,
+    snapshot: &BTreeMap<i64, i64>,
+) -> Vec<LevelDifference> {
+    let prices: BTreeSet<i64> = book.keys().chain(snapshot.keys()).copied().collect();
+    let quantity = |levels: &BTreeMap<i64, i64>, price| levels.get(&price).copied().unwrap_or(0);
+    let compared = prices.into_iter().map(|price| LevelDifference {
+        side,
+        price,
+        book: quantity(book, price),
+        snapshot: quantity(snapshot, price),
+    });
+    let differs = |level: &LevelDifference| level.book != level.snapshot;
+    compared.filter(differs).collect()
 }
 
 /// Collects levels so the last entry for a price wins, then drops levels
@@ -383,5 +429,32 @@ mod tests {
     fn to_snapshot_falls_back_to_received_at_for_exchange_time() {
         let snapshot = Book::default().to_snapshot("T", ts(3));
         assert_eq!(snapshot.exchange_timestamp, ts(3));
+    }
+
+    #[test]
+    fn a_snapshot_of_the_same_levels_in_any_order_has_no_differences() {
+        let mut book = Book::default();
+        book.replace([(100_000, 1), (300_000, 2)], [(700_000, 3)], None);
+        let bids = [(300_000, 2), (100_000, 1), (200_000, 0)];
+        assert_eq!(book.differences(bids, [(700_000, 3)]), []);
+    }
+
+    #[test]
+    fn differences_name_each_level_changed_missing_or_extra() {
+        let mut book = Book::default();
+        book.replace([(100_000, 1), (300_000, 2)], [(700_000, 3)], None);
+        let found = book.differences([(300_000, 5)], [(700_000, 3), (800_000, 4)]);
+        let difference = |side, price, book, snapshot| LevelDifference {
+            side,
+            price,
+            book,
+            snapshot,
+        };
+        let expected = [
+            difference(Side::Buy, 100_000, 1, 0),
+            difference(Side::Buy, 300_000, 2, 5),
+            difference(Side::Sell, 800_000, 0, 4),
+        ];
+        assert_eq!(found, expected);
     }
 }

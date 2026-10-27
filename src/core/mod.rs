@@ -6,6 +6,8 @@ pub mod events;
 pub mod fixed;
 pub mod shard;
 pub mod stats;
+#[cfg(test)]
+mod test_logs;
 pub mod verify;
 pub mod watchdog;
 pub mod writer;

@@ -90,6 +90,12 @@ pub struct RecordArgs {
     #[arg(long, value_name = "SECS", default_value = "600", value_parser = parse_seconds)]
     pub reconcile_interval: Duration,
 
+    /// How many markets each shard audits a minute, comparing a fresh
+    /// snapshot from the exchange with the recorded book; 0 turns audits
+    /// off.
+    #[arg(long, value_name = "N", default_value = "5")]
+    pub audit_markets: usize,
+
     #[command(flatten)]
     pub secrets: SecretsArgs,
 }
@@ -198,6 +204,7 @@ mod tests {
             failover_warmup: Duration::from_secs(5),
             flush_interval: None,
             reconcile_interval: Duration::from_secs(600),
+            audit_markets: 5,
             secrets: SecretsArgs {
                 dir: PathBuf::from("secrets"),
             },
@@ -278,6 +285,16 @@ mod tests {
             ..default_record_args()
         };
         let parsed = parse(&["record", "--reconcile-interval", "300"]).unwrap();
+        assert_eq!(parsed, Command::Record(expected));
+    }
+
+    #[test]
+    fn record_takes_an_audit_size_and_zero_turns_audits_off() {
+        let expected = RecordArgs {
+            audit_markets: 0,
+            ..default_record_args()
+        };
+        let parsed = parse(&["record", "--audit-markets", "0"]).unwrap();
         assert_eq!(parsed, Command::Record(expected));
     }
 

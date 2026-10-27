@@ -34,6 +34,12 @@ impl ConnectionBudget {
         }
     }
 
+    /// Whether a new shard of at least one connection fits beside the
+    /// reserved connections while the open shards hold `open`.
+    pub(super) fn has_room_for_shard(&self, open: usize) -> bool {
+        open + 1 + RESERVED_CONNECTIONS <= self.max_connections
+    }
+
     /// Whether a shard of `replicas` runs short of the configured count.
     pub(super) fn is_short(&self, replicas: NonZeroUsize) -> bool {
         replicas < self.replicas
@@ -66,6 +72,13 @@ mod tests {
     #[test]
     fn a_seventy_fifth_paired_shard_fits_within_the_default_budget() {
         assert_eq!(pairs_within(190).replicas_for(2 * 74).get(), 2);
+    }
+
+    #[test]
+    fn a_shard_has_room_while_one_more_connection_fits() {
+        let budget = pairs_within(190);
+        let room = [188, 189].map(|open| budget.has_room_for_shard(open));
+        assert_eq!(room, [true, false]);
     }
 
     #[test]

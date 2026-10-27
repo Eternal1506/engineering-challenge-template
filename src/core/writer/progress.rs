@@ -15,13 +15,40 @@ const STALL_POLL: Duration = Duration::from_millis(100);
 /// thread blocked and was woken.
 const WAKEUPS_FIELD: &str = "voluntary_ctxt_switches:";
 
-/// What the writer thread has written so far, and how often it has woken.
+/// What the writer thread has written so far, how its book audits came
+/// out, and how often it has woken.
 #[derive(Debug, Default)]
 pub struct WriterProgress {
     snapshots_written: AtomicU64,
     updates_written: AtomicU64,
+    audits_matched: AtomicU64,
+    audits_mismatched: AtomicU64,
     /// The writer thread's `/proc` status file, once the thread has found it.
     thread_status: OnceLock<PathBuf>,
+}
+
+/// How the audit snapshots compared with the writer's books so far.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AuditCounts {
+    /// Audit snapshots that matched their book level for level.
+    pub matched: u64,
+    /// Audit snapshots that differed from their book, and replaced it.
+    pub mismatched: u64,
+}
+
+impl AuditCounts {
+    /// Every audit snapshot compared with a book.
+    pub fn total(&self) -> u64 {
+        self.matched + self.mismatched
+    }
+
+    /// The share of audits that matched, in percent to one decimal place;
+    /// `None` before any.
+    pub fn match_percent(&self) -> Option<f64> {
+        let total = self.total();
+        let tenths = (total > 0).then(|| (self.matched * 1000) as f64 / total as f64);
+        tenths.map(|tenths| tenths.round() / 10.0)
+    }
 }
 
 /// One reading of every sign that the writer is moving.
@@ -40,6 +67,24 @@ impl WriterProgress {
     /// `PriceLevelUpdate` messages written so far.
     pub fn updates_written(&self) -> u64 {
         self.updates_written.load(Ordering::Relaxed)
+    }
+
+    /// How the audit snapshots compared with the books so far.
+    pub fn audits(&self) -> AuditCounts {
+        AuditCounts {
+            matched: self.audits_matched.load(Ordering::Relaxed),
+            mismatched: self.audits_mismatched.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Counts one audit snapshot that matched its book.
+    pub(crate) fn note_audit_match(&self) {
+        self.audits_matched.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one audit snapshot that differed from its book.
+    pub(crate) fn note_audit_mismatch(&self) {
+        self.audits_mismatched.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Messages of both kinds written so far.
@@ -145,6 +190,21 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn the_match_rate_is_the_share_of_audits_that_matched_to_a_tenth() {
+        let progress = WriterProgress::default();
+        progress.note_audit_match();
+        progress.note_audit_match();
+        progress.note_audit_mismatch();
+        let audits = progress.audits();
+        assert_eq!((audits.total(), audits.match_percent()), (3, Some(66.7)));
+    }
+
+    #[test]
+    fn there_is_no_match_rate_before_any_audit() {
+        assert_eq!(WriterProgress::default().audits().match_percent(), None);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_writer_that_writes_nothing_stalls_after_the_window() {

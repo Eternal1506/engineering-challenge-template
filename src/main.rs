@@ -9,7 +9,7 @@ use engineering_challenge::cli::{Cli, Command, RecordArgs, SecretsArgs, VerifyAr
 use engineering_challenge::core::coordinator::{
     Coordinator, CoordinatorConfig, DEFAULT_STALL_TIMEOUT, Feed, LifecycleTimings, WriterLink,
 };
-use engineering_challenge::core::shard::FailoverTimings;
+use engineering_challenge::core::shard::{BookAudit, FailoverTimings, MonitorConfig};
 use engineering_challenge::core::verify::{VerifyLimits, verify_files};
 use engineering_challenge::core::watchdog::{Watched, spawn_watchdog};
 use engineering_challenge::core::writer::{
@@ -128,6 +128,13 @@ fn coordinator_config(args: &RecordArgs) -> CoordinatorConfig {
         lifecycle: LifecycleTimings {
             reconcile_interval: args.reconcile_interval,
             ..defaults.lifecycle.clone()
+        },
+        monitor: MonitorConfig {
+            audit: BookAudit {
+                markets: args.audit_markets,
+                ..defaults.monitor.audit.clone()
+            },
+            ..defaults.monitor.clone()
         },
         ..defaults
     }

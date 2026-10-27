@@ -65,13 +65,38 @@
 //!
 //! It also turns the coordinator's [`ShardCommand`]s into connection
 //! [`Request`](crate::core::ws::Request)s: adds and removals for every
-//! replica, snapshot requests for the primary.
+//! replica, snapshot requests for the primary. Only events of the symbols
+//! the shard records go on, so once a removal is handled, nothing more of
+//! the removed symbols reaches the writer from this shard.
+//!
+//! It watches the primary's markets as [`StaleChecks`] says. A busy market
+//! that goes silent is resubscribed on the primary, a removal and an add,
+//! and held back as in a resync until the add's snapshot. While a warm
+//! standby delivers level changes, a market counts as silent only if a
+//! standby has seen it change since the primary last did. A market
+//! resubscribed, or found silent when the socket was taken to be dead, is
+//! not counted as silent again until it next changes. When too many go
+//! silent at once, the primary's socket is taken to be dead: the warm
+//! standby that saw most of them change takes over, as from a silent
+//! primary, or else the primary reconnects.
+//!
+//! As [`BookAudit`] says, it asks the primary for snapshots of a few of its
+//! markets in turn, and sends each reply to the writer as an
+//! [`Audit`](crate::core::writer::WriterMessage::Audit) to be compared with
+//! the book, unless its symbol is held back, when the reply releases it as
+//! any snapshot does.
+//!
+//! It reports each overflow its primary sees to the coordinator, which
+//! splits a shard that overflows too often.
 
+mod activity;
+mod audit;
 mod failover;
 mod health;
 mod inputs;
 mod replica;
 mod resync;
+mod stale;
 mod supervisor;
 
 use std::collections::BTreeSet;
@@ -93,6 +118,9 @@ use crate::exchange::{FeedCodec, FeedEndpoint};
 use failover::ReplicaSet;
 use replica::ReplicaFactory;
 use supervisor::Supervisor;
+
+pub use audit::BookAudit;
+pub use stale::StaleChecks;
 
 /// The default capacity of the channel from a shard's connection to its
 /// supervisor.
@@ -232,6 +260,31 @@ pub enum ShardCommand {
     Remove(Vec<Arc<str>>),
     /// Ask the exchange for a fresh snapshot of this symbol.
     Resnapshot(Arc<str>),
+    /// Stop recording these symbols, as [`Remove`](Self::Remove) does, and
+    /// report [`ShardReport::Released`] once nothing more of theirs will
+    /// reach the writer from this shard.
+    Release(Vec<Arc<str>>),
+}
+
+/// Something a shard tells the coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardReport {
+    /// The shard's primary reported an overflow.
+    Overflowed(ShardId),
+    /// The shard has stopped recording the symbols of a
+    /// [`ShardCommand::Release`], and every event of theirs it delivered is
+    /// in the writer's channel.
+    Released(ShardId),
+}
+
+/// How each shard watches its markets and audits its books.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MonitorConfig {
+    /// When silent markets are resubscribed, or the primary's socket is
+    /// treated as dead.
+    pub staleness: StaleChecks,
+    /// How often books are audited, and how many at a time.
+    pub audit: BookAudit,
 }
 
 /// What every shard of one recorder shares.
@@ -249,8 +302,12 @@ pub struct ShardContext<E, C> {
     pub resync: ResyncTimings,
     /// When each shard's standbys start and may take over.
     pub failover: FailoverTimings,
+    /// How each shard watches its markets and audits its books.
+    pub monitor: MonitorConfig,
     /// The writer's input channel.
     pub writer: mpsc::Sender<WriterMessage>,
+    /// Where each shard sends what it tells the coordinator.
+    pub reports: mpsc::UnboundedSender<ShardReport>,
     /// The counters the shards keep.
     pub counters: Arc<RecorderCounters>,
     /// The parent of every shard's cancellation token.
@@ -284,8 +341,7 @@ impl ShardHandle {
         let factory = ReplicaFactory::new(context, cancel.clone(), span.clone());
         let replicas = ReplicaSet::start(factory, &plan, context.failover.clone());
         context.counters.note_socket_started();
-        let heartbeat = context.heartbeats.register(&format!("shard {}", id.0));
-        let supervisor = Supervisor::new(replicas, heartbeat, context);
+        let supervisor = Supervisor::new(id, replicas, context);
         let (commands, command_receiver) = mpsc::unbounded_channel();
         let running = supervisor.run(plan.symbols, command_receiver);
         let task = tokio::spawn(running.instrument(span));

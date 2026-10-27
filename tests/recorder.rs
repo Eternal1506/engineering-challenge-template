@@ -6,6 +6,8 @@ mod common;
 #[path = "mock_exchange/mod.rs"]
 mod mock_exchange;
 
+#[path = "recorder/audits.rs"]
+mod audits;
 #[path = "recorder/failover.rs"]
 mod failover;
 #[path = "recorder/health.rs"]
@@ -22,6 +24,10 @@ mod resync;
 mod sharding;
 #[path = "recorder/shutdown.rs"]
 mod shutdown;
+#[path = "recorder/splits.rs"]
+mod splits;
+#[path = "recorder/staleness.rs"]
+mod staleness;
 #[path = "recorder/stalls.rs"]
 mod stalls;
 #[path = "recorder/takeover.rs"]
@@ -35,9 +41,12 @@ use std::time::Duration;
 use common::{Levels, Recorded, read_recording, snapshot_sides, verify_clean};
 use engineering_challenge::Side;
 use engineering_challenge::core::coordinator::{
-    Coordinator, CoordinatorConfig, DEFAULT_MAX_CONNECTIONS, Feed, LifecycleTimings, WriterLink,
+    Coordinator, CoordinatorConfig, DEFAULT_MAX_CONNECTIONS, Feed, LifecycleTimings, SplitRule,
+    WriterLink,
 };
-use engineering_challenge::core::shard::{FailoverTimings, ResyncTimings};
+use engineering_challenge::core::shard::{
+    BookAudit, FailoverTimings, MonitorConfig, ResyncTimings, StaleChecks,
+};
 use engineering_challenge::core::stats::RecorderCounters;
 use engineering_challenge::core::watchdog::Heartbeats;
 use engineering_challenge::core::writer::{
@@ -60,9 +69,25 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const BIDS: &[(i64, i64)] = &[(400_000, 100)];
 const ASKS: &[(i64, i64)] = &[(600_000, 50)];
 
+/// Monitoring that never acts within a test: silence checks an hour apart
+/// and no audits.
+fn quiet_monitor() -> MonitorConfig {
+    MonitorConfig {
+        staleness: StaleChecks {
+            interval: Duration::from_secs(3600),
+            ..StaleChecks::default()
+        },
+        audit: BookAudit {
+            markets: 0,
+            ..BookAudit::default()
+        },
+    }
+}
+
 /// A coordinator with shards of `shard_size` on one connection each, quick
 /// reconnects, no stats line during a test, subscription changes batched
-/// for 100 ms, a sweep every 100 ms and no reconcile within a test.
+/// for 100 ms, a sweep every 100 ms, no reconcile within a test, and
+/// monitoring that never acts.
 fn config(shard_size: usize) -> CoordinatorConfig {
     CoordinatorConfig {
         shard_size,
@@ -83,6 +108,8 @@ fn config(shard_size: usize) -> CoordinatorConfig {
             timeout: Duration::from_secs(5),
             ..ResyncTimings::default()
         },
+        monitor: quiet_monitor(),
+        split: SplitRule::default(),
         stats_interval: Duration::from_secs(3600),
         stall_timeout: Duration::from_secs(2),
         lifecycle: LifecycleTimings {

@@ -99,7 +99,7 @@ impl HealthMonitor {
     /// resync has left a live market unanswered: the one that delivered the
     /// most level changes over the window, if any. None during the
     /// cooldown.
-    pub(super) fn resync_standby(&self, readings: &Readings, now: Instant) -> Option<usize> {
+    pub(super) fn delivering_standby(&self, readings: &Readings, now: Instant) -> Option<usize> {
         let busiest = busiest(&readings.standbys).filter(|_| self.may_take_over(now))?;
         (busiest.level_changes > 0).then_some(busiest.replica)
     }
@@ -112,7 +112,7 @@ impl HealthMonitor {
 
     /// Whether a standby may take over from a connected primary at `now`:
     /// false during the cooldown.
-    fn may_take_over(&self, now: Instant) -> bool {
+    pub(super) fn may_take_over(&self, now: Instant) -> bool {
         self.cooldown_until.is_none_or(|until| now >= until)
     }
 
@@ -310,13 +310,13 @@ mod tests {
     fn a_resync_hands_over_to_the_busiest_delivering_standby() {
         let standbys = [reading(1, 3, None), reading(2, 5, None)];
         let seen = readings(reading(0, 50, None), &standbys);
-        assert_eq!(monitor().resync_standby(&seen, Instant::now()), Some(2));
+        assert_eq!(monitor().delivering_standby(&seen, Instant::now()), Some(2));
     }
 
     #[test]
     fn a_resync_does_not_hand_over_to_a_standby_delivering_nothing() {
         let seen = readings(reading(0, 50, None), &[reading(1, 0, None)]);
-        assert_eq!(monitor().resync_standby(&seen, Instant::now()), None);
+        assert_eq!(monitor().delivering_standby(&seen, Instant::now()), None);
     }
 
     #[test]
@@ -325,7 +325,7 @@ mod tests {
         let now = Instant::now();
         monitor.note_takeover(now);
         let seen = readings(reading(0, 50, None), &[reading(1, 50, None)]);
-        assert_eq!(monitor.resync_standby(&seen, now), None);
+        assert_eq!(monitor.delivering_standby(&seen, now), None);
     }
 
     #[test]

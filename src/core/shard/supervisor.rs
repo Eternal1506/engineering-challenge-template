@@ -1,8 +1,10 @@
 //! [`Supervisor`]: the task between a shard's connections and the writer.
-//! Its replica roles and failovers are in [`roles`], and its takeovers from
-//! a connected primary in [`handover`].
+//! Its replica roles and failovers are in [`roles`], its takeovers from a
+//! connected primary in [`handover`], and its watch over its markets and
+//! books in [`monitoring`].
 
 mod handover;
+mod monitoring;
 mod roles;
 
 use std::collections::BTreeSet;
@@ -13,27 +15,35 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use super::audit::AuditRotation;
 use super::failover::{ReplicaInput, ReplicaSet};
 use super::health::HealthMonitor;
 use super::inputs::{Deadlines, Input, Inputs};
 use super::resync::{Remedy, Resync};
-use super::{ShardCommand, ShardContext};
+use super::stale::{Seen, StaleWatch};
+use super::{ShardCommand, ShardContext, ShardId, ShardReport};
 use crate::core::events::{Decoded, FeedBody, FeedErrorKind, FeedEvent, Inbound};
-use crate::core::stats::RecorderCounters;
+use crate::core::stats::{ActivityGauge, RecorderCounters};
 use crate::core::watchdog::Heartbeat;
 use crate::core::writer::WriterMessage;
 use crate::core::ws::{ConnectionEvent, Request};
 
 /// The task between a shard's connections and the writer.
 pub(super) struct Supervisor {
+    id: ShardId,
     replicas: ReplicaSet,
     writer: mpsc::Sender<WriterMessage>,
+    reports: mpsc::UnboundedSender<ShardReport>,
     counters: Arc<RecorderCounters>,
     abandon: CancellationToken,
     /// The symbols the shard records.
     symbols: BTreeSet<Arc<str>>,
     resync: Resync,
     health: HealthMonitor,
+    stale: StaleWatch,
+    audits: AuditRotation,
+    /// The shard's busy markets as the stats line shows them.
+    activity: ActivityGauge,
     next_tag: u64,
     /// Set when the shard asks its primary to reconnect, until that
     /// primary's socket is lost or a new one connects.
@@ -44,24 +54,30 @@ pub(super) struct Supervisor {
 }
 
 impl Supervisor {
-    /// A supervisor of `replicas`, beating `heartbeat`, with no symbols
-    /// until [`Supervisor::run`].
+    /// The supervisor of shard `id`'s `replicas`, its heartbeat registered
+    /// as `shard <id>`, with no symbols until [`Supervisor::run`].
     pub(super) fn new<E, C>(
+        id: ShardId,
         replicas: ReplicaSet,
-        heartbeat: Heartbeat,
         context: &ShardContext<E, C>,
     ) -> Self {
+        let monitor = &context.monitor;
         Self {
+            id,
             replicas,
             writer: context.writer.clone(),
+            reports: context.reports.clone(),
             counters: context.counters.clone(),
             abandon: context.abandon.clone(),
             symbols: BTreeSet::new(),
             resync: Resync::new(context.resync.clone()),
             health: HealthMonitor::new(context.failover.health.clone()),
+            stale: StaleWatch::new(monitor.staleness.clone()),
+            audits: AuditRotation::new(monitor.audit.clone()),
+            activity: ActivityGauge::new(context.counters.clone()),
             next_tag: 0,
             reconnect_requested: false,
-            heartbeat,
+            heartbeat: context.heartbeats.register(&format!("shard {}", id.0)),
         }
     }
 
@@ -100,6 +116,8 @@ impl Supervisor {
             standbys: self.replicas.standbys_due(),
             promotion: self.replicas.promotion_due(),
             health: self.health_check_due(),
+            stale: self.stale_check_due(),
+            audit: self.audit_round_due(),
         }
     }
 
@@ -115,6 +133,8 @@ impl Supervisor {
             Input::StandbysDue => self.start_standbys(),
             Input::PromotionDue => self.on_promotion_due(),
             Input::HealthCheck => self.on_health_check(),
+            Input::StaleCheck => self.on_stale_check(),
+            Input::AuditRound => self.on_audit_round(),
         }
         ControlFlow::Continue(())
     }
@@ -149,21 +169,32 @@ impl Supervisor {
                 self.symbols.extend(symbols.iter().cloned());
                 self.replicas.request_all(&Request::Add(symbols));
             }
-            ShardCommand::Remove(symbols) => {
-                self.forget(&symbols);
-                self.replicas.request_all(&Request::Remove(symbols));
-            }
+            ShardCommand::Remove(symbols) => self.remove(symbols),
             ShardCommand::Resnapshot(symbol) => {
                 self.request_snapshot(vec![symbol]);
+            }
+            ShardCommand::Release(symbols) => {
+                self.remove(symbols);
+                self.report(ShardReport::Released(self.id));
             }
         }
     }
 
-    /// Stops recording `symbols`, which no resync waits for any more.
+    /// Stops recording `symbols` and unsubscribes them on every replica.
+    /// Every event of theirs forwarded so far is in the writer's channel,
+    /// since forwarding waits for room, and none is forwarded from now on.
+    fn remove(&mut self, symbols: Vec<Arc<str>>) {
+        self.forget(&symbols);
+        self.replicas.request_all(&Request::Remove(symbols));
+    }
+
+    /// Stops recording `symbols`, which no resync waits for and no check
+    /// watches any more.
     fn forget(&mut self, symbols: &[Arc<str>]) {
         for symbol in symbols {
             self.symbols.remove(symbol);
             self.settle(symbol);
+            self.stale.forget(symbol);
         }
     }
 
@@ -177,10 +208,11 @@ impl Supervisor {
         tag
     }
 
-    /// Notes `event`'s bearing on replica `replica`'s health, then handles
-    /// it as its role calls for.
+    /// Notes `event`'s bearing on replica `replica`'s health, reports an
+    /// overflow, then handles the event as its role calls for.
     async fn handle(&mut self, replica: usize, event: ConnectionEvent) -> ControlFlow<()> {
         self.replicas.observe(replica, &event);
+        self.note_overflow(replica, &event);
         if self.replicas.is_primary(replica) {
             return self.handle_primary(event).await;
         }
@@ -201,23 +233,25 @@ impl Supervisor {
         ControlFlow::Continue(())
     }
 
-    /// A standby's events only tell how it is doing: nothing of it reaches
-    /// the writer or the resync. A standby that connects while the primary
-    /// is down takes over.
+    /// A standby's events only tell how it is doing, and which markets are
+    /// changing: nothing of it reaches the writer or the resync. A standby
+    /// that connects while the primary is down takes over.
     fn handle_standby(&mut self, replica: usize, event: ConnectionEvent) {
         match event {
             ConnectionEvent::Connected => self.on_standby_connected(replica),
             ConnectionEvent::Disconnected { reason } => self.on_standby_lost(replica, &reason),
             ConnectionEvent::Rejected { symbols, kind } => log_rejected(&symbols, &kind),
-            ConnectionEvent::Frame { .. } | ConnectionEvent::Gap { .. } => {}
+            ConnectionEvent::Frame { decoded, .. } => self.note_standby_frame(replica, &decoded),
+            ConnectionEvent::Gap { .. } => {}
         }
     }
 
-    /// Forwards feed events. Logs an error the exchange sent unprompted at
-    /// warn; the connection already logs errors that answer a command.
+    /// Forwards feed events, `tag` naming the snapshot request a reply
+    /// answers. Logs an error the exchange sent unprompted at warn; the
+    /// connection already logs errors that answer a command.
     async fn on_message(&mut self, decoded: Decoded, tag: Option<u64>) -> ControlFlow<()> {
         match decoded.message {
-            Inbound::Feed(event) => return self.on_feed(event).await,
+            Inbound::Feed(event) => return self.on_feed(event, tag).await,
             Inbound::Error { sub, kind } if decoded.reply_to.is_none() => {
                 let sub = sub.map(|sub| sub.0);
                 tracing::warn!(sub, error = ?kind, "the exchange reported an error");
@@ -227,18 +261,54 @@ impl Supervisor {
         ControlFlow::Continue(())
     }
 
-    /// Forwards `event`, unless it is a level change of a symbol held back
-    /// by a resync. A snapshot releases its symbol.
-    async fn on_feed(&mut self, event: FeedEvent) -> ControlFlow<()> {
-        match event.body {
-            FeedBody::Level(_) if self.resync.holds_back(&event.symbol) => {
-                self.drop_held_change(&event.symbol);
-                return ControlFlow::Continue(());
-            }
-            FeedBody::Snapshot { .. } => self.settle(&event.symbol),
-            FeedBody::Level(_) => {}
+    /// Handles `event` if its symbol is one the shard records, dropping
+    /// it otherwise: a removed symbol's last events from the old
+    /// subscription, which the writer no longer wants from this shard.
+    async fn on_feed(&mut self, event: FeedEvent, tag: Option<u64>) -> ControlFlow<()> {
+        if !self.symbols.contains(&event.symbol) {
+            return ControlFlow::Continue(());
         }
-        self.forward(event).await
+        match event.body {
+            FeedBody::Level(_) => self.on_level_change(event).await,
+            FeedBody::Snapshot { .. } => self.on_snapshot(event, tag).await,
+        }
+    }
+
+    /// Notes the change for the silence checks, then forwards it, unless
+    /// its symbol is held back by a resync.
+    async fn on_level_change(&mut self, event: FeedEvent) -> ControlFlow<()> {
+        let seen = Seen::now(event.exchange_ts);
+        self.stale.note_change(&event.symbol, seen);
+        if self.resync.holds_back(&event.symbol) {
+            self.drop_held_change(&event.symbol);
+            return ControlFlow::Continue(());
+        }
+        self.note_lag(&event);
+        self.forward(WriterMessage::Event(event)).await
+    }
+
+    /// Forwards a snapshot, which releases its symbol. The reply to an
+    /// audit goes to be compared with the book, unless it released the
+    /// symbol, whose book is then stale.
+    async fn on_snapshot(&mut self, event: FeedEvent, tag: Option<u64>) -> ControlFlow<()> {
+        let held = self.resync.holds_back(&event.symbol);
+        self.settle(&event.symbol);
+        let audit = tag.is_some_and(|tag| self.audits.is_audit(tag));
+        let message = if audit && !held {
+            WriterMessage::Audit(event)
+        } else {
+            WriterMessage::Event(event)
+        };
+        self.forward(message).await
+    }
+
+    /// Counts the feed lag of level change `event`, if it says when the
+    /// exchange sent it.
+    fn note_lag(&self, event: &FeedEvent) {
+        if let Some(sent) = event.exchange_ts {
+            let lag = event.received_at - sent;
+            self.counters.note_feed_lag(lag.num_milliseconds());
+        }
     }
 
     /// Drops a level change of `symbol`, which is held back. A change after
@@ -263,12 +333,17 @@ impl Supervisor {
         tracing::debug!(%symbol, tag, "asking again for a held market's snapshot");
     }
 
-    /// Reconnects the primary because `symbol` is still unanswered. The
-    /// loss of its socket that follows is not failed over.
+    /// Reconnects the primary because `symbol` is still unanswered.
     fn reconnect_primary(&mut self, symbol: &str) {
         self.counters.note_resync_reconnect();
-        self.reconnect_requested = true;
         tracing::warn!(%symbol, "a market is still unanswered, reconnecting");
+        self.ask_primary_to_reconnect();
+    }
+
+    /// Asks the primary to reconnect. The loss of its socket that follows
+    /// is not failed over.
+    fn ask_primary_to_reconnect(&mut self) {
+        self.reconnect_requested = true;
         self.replicas.request_primary(Request::Reconnect);
     }
 
@@ -281,11 +356,11 @@ impl Supervisor {
         }
     }
 
-    /// Sends `event` to the writer, waiting for room, and beating while it
-    /// waits, until the abandon token fires. If the writer has gone or is
-    /// abandoned, shuts the connections down.
-    async fn forward(&mut self, event: FeedEvent) -> ControlFlow<()> {
-        let sending = self.writer.send(WriterMessage::Event(event));
+    /// Sends `message` to the writer, waiting for room, and beating while
+    /// it waits, until the abandon token fires. If the writer has gone or
+    /// is abandoned, shuts the connections down.
+    async fn forward(&mut self, message: WriterMessage) -> ControlFlow<()> {
+        let sending = self.writer.send(message);
         let sent = tokio::select! {
             biased;
             sent = self.heartbeat.beat_while(sending) => sent.is_ok(),

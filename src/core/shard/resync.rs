@@ -5,7 +5,9 @@
 //! A connection delivers its messages in order, so any snapshot of a symbol
 //! that arrives after the gap already includes whatever the gap lost. Each
 //! symbol leaves the resync on its own snapshot, whichever request it
-//! answers; the resync is complete once every symbol has.
+//! answers; the resync is complete once every symbol has. A few symbols can
+//! also be held on their own, as when they are resubscribed, which joins
+//! them to any resync running or starts one of just them.
 //!
 //! A symbol still waiting at the deadline may be a market the exchange has
 //! dropped, which never answers and never changes, so it is simply kept
@@ -82,6 +84,19 @@ impl Resync {
         } else {
             Clock::Running(self.started + self.timings.timeout)
         };
+    }
+
+    /// Holds back `symbols` too, until their next snapshot, as in a
+    /// resync. Starts the deadline if no resync is running; one that is
+    /// keeps its own.
+    pub(super) fn hold(&mut self, symbols: &[Arc<str>]) {
+        for symbol in symbols {
+            self.waiting.entry(symbol.clone()).or_insert(None);
+        }
+        if self.clock == Clock::Stopped && !self.waiting.is_empty() {
+            self.started = Instant::now();
+            self.clock = Clock::Running(self.started + self.timings.timeout);
+        }
     }
 
     /// Whether `symbol`'s level changes are held back.
@@ -278,5 +293,30 @@ mod tests {
     #[test]
     fn a_resync_of_no_symbols_has_no_deadline() {
         assert_eq!(resync_of(&[]).deadline(), None);
+    }
+
+    #[test]
+    fn a_hold_holds_back_only_its_symbols_and_starts_the_deadline() {
+        let mut resync = resync_of(&[]);
+        resync.hold(&["A".into()]);
+        let held = (resync.holds_back("A"), resync.holds_back("B"));
+        assert_eq!((held, resync.deadline().is_some()), ((true, false), true));
+    }
+
+    #[test]
+    fn a_hold_during_a_resync_keeps_its_deadline() {
+        let mut resync = resync_of(&["A"]);
+        let deadline = resync.deadline();
+        std::thread::sleep(Duration::from_millis(5));
+        resync.hold(&["B".into()]);
+        let state = (resync.holds_back("B"), resync.deadline());
+        assert_eq!(state, (true, deadline));
+    }
+
+    #[test]
+    fn the_snapshot_of_a_held_symbol_completes_the_hold() {
+        let mut resync = resync_of(&[]);
+        resync.hold(&["A".into()]);
+        assert_eq!((resync.settle("A"), resync.deadline()), (true, None));
     }
 }
