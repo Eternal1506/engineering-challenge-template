@@ -31,6 +31,13 @@ pub(super) async fn open(endpoint: &impl FeedEndpoint) -> anyhow::Result<Socket>
     Ok(socket)
 }
 
+/// The local TCP port of `socket`, which tells one connection's socket from
+/// another's to tools outside the process.
+pub(super) fn local_port(socket: &Socket) -> Option<u16> {
+    let stream = socket.get_ref().get_ref();
+    stream.local_addr().ok().map(|address| address.port())
+}
+
 /// Sends a close frame and waits for the server's close or the end of the
 /// stream, discarding anything else that arrives. Gives up after `timeout`
 /// in all, sending included.

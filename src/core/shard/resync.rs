@@ -1,5 +1,6 @@
 //! [`Resync`]: which of a shard's symbols wait for a fresh snapshot after a
-//! sequence gap, and until when.
+//! sequence gap or a failover, and what to do about one that changes while
+//! it waits.
 //!
 //! A connection delivers its messages in order, so any snapshot of a symbol
 //! that arrives after the gap already includes whatever the gap lost. Each
@@ -8,22 +9,30 @@
 //!
 //! A symbol still waiting at the deadline may be a market the exchange has
 //! dropped, which never answers and never changes, so it is simply kept
-//! waiting. Only a change to it after the deadline shows it is live and
-//! still stale, and calls for a new socket.
+//! waiting. A change to it after the deadline shows it is live and still
+//! stale: its snapshot is asked for again, at most once per
+//! [`ResyncTimings::resnapshot_interval`]. Only once the resync has lasted
+//! [`ResyncTimings::reconnect_after`], and the socket has been the primary
+//! for [`ResyncTimings::primary_cooldown`], does such a change call for a
+//! new socket.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::ResyncTimings;
+
 /// The symbols of one shard still waiting for a snapshot, and where the
 /// resync stands.
 #[derive(Debug)]
 pub(super) struct Resync {
-    timeout: Duration,
-    /// Symbols whose level changes are held back until their next snapshot.
-    waiting: HashSet<Arc<str>>,
+    timings: ResyncTimings,
+    /// Symbols whose level changes are held back until their next
+    /// snapshot, each with when its snapshot was last asked for again.
+    waiting: HashMap<Arc<str>, Option<Instant>>,
+    started: Instant,
     clock: Clock,
 }
 
@@ -36,16 +45,28 @@ enum Clock {
     Running(Instant),
     /// The deadline passed with symbols still waiting.
     Overdue,
-    /// A waiting symbol changed after the deadline; a new socket is due.
+    /// A waiting symbol changed past the ceiling; a new socket is due.
     Replacing,
 }
 
+/// What a change to a held symbol calls for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Remedy {
+    /// Nothing: the snapshot asked for may still come.
+    Wait,
+    /// Ask for the symbol's snapshot again.
+    Resnapshot,
+    /// Replace the socket: its resubscribe brings every snapshot.
+    NewSocket,
+}
+
 impl Resync {
-    /// No resync running; each one started may take `timeout`.
-    pub(super) fn new(timeout: Duration) -> Self {
+    /// No resync running; each one started runs on `timings`.
+    pub(super) fn new(timings: ResyncTimings) -> Self {
         Self {
-            timeout,
-            waiting: HashSet::new(),
+            timings,
+            waiting: HashMap::new(),
+            started: Instant::now(),
             clock: Clock::Stopped,
         }
     }
@@ -53,23 +74,25 @@ impl Resync {
     /// Starts a resync of `symbols`, replacing any running one and
     /// restarting the deadline.
     pub(super) fn start(&mut self, symbols: &BTreeSet<Arc<str>>) {
-        self.waiting = symbols.iter().cloned().collect();
+        let unasked = |symbol: &Arc<str>| (symbol.clone(), None);
+        self.waiting = symbols.iter().map(unasked).collect();
+        self.started = Instant::now();
         self.clock = if self.waiting.is_empty() {
             Clock::Stopped
         } else {
-            Clock::Running(Instant::now() + self.timeout)
+            Clock::Running(self.started + self.timings.timeout)
         };
     }
 
     /// Whether `symbol`'s level changes are held back.
     pub(super) fn holds_back(&self, symbol: &str) -> bool {
-        self.waiting.contains(symbol)
+        self.waiting.contains_key(symbol)
     }
 
     /// `symbol` needs no snapshot any more: one arrived, or the shard
     /// dropped it. True if that completed the resync before its deadline.
     pub(super) fn settle(&mut self, symbol: &str) -> bool {
-        if !self.waiting.remove(symbol) || !self.waiting.is_empty() {
+        if self.waiting.remove(symbol).is_none() || !self.waiting.is_empty() {
             return false;
         }
         let in_time = matches!(self.clock, Clock::Running(_));
@@ -92,14 +115,34 @@ impl Resync {
         self.waiting.len()
     }
 
-    /// A waiting symbol changed. True the first time that happens after the
-    /// deadline, when only a new socket will bring its snapshot.
-    pub(super) fn needs_new_socket(&mut self) -> bool {
-        let overdue = self.clock == Clock::Overdue;
-        if overdue {
-            self.clock = Clock::Replacing;
+    /// Held `symbol` changed on a socket that has been the primary for
+    /// `primary_for`. Before the deadline the snapshot asked for may still
+    /// come; after it, a long resync on a settled socket calls for a new
+    /// socket, once, and otherwise the symbol's snapshot is asked for again
+    /// if it was not asked for within the interval.
+    pub(super) fn remedy(&mut self, symbol: &str, primary_for: Duration) -> Remedy {
+        if self.clock != Clock::Overdue {
+            return Remedy::Wait;
         }
-        overdue
+        let now = Instant::now();
+        let ceiling_passed = now - self.started >= self.timings.reconnect_after;
+        if ceiling_passed && primary_for >= self.timings.primary_cooldown {
+            self.clock = Clock::Replacing;
+            return Remedy::NewSocket;
+        }
+        self.resnapshot_if_due(symbol, now)
+    }
+
+    fn resnapshot_if_due(&mut self, symbol: &str, now: Instant) -> Remedy {
+        let Some(asked_again) = self.waiting.get_mut(symbol) else {
+            return Remedy::Wait;
+        };
+        let interval = self.timings.resnapshot_interval;
+        if asked_again.is_some_and(|at| now - at < interval) {
+            return Remedy::Wait;
+        }
+        *asked_again = Some(now);
+        Remedy::Resnapshot
     }
 
     /// The socket went down: the deadline no longer applies, and the next
@@ -121,10 +164,27 @@ impl Resync {
 mod tests {
     use super::*;
 
-    fn resync_of(symbols: &[&str]) -> Resync {
-        let mut resync = Resync::new(Duration::from_secs(10));
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// Timings whose ceiling and cooldown are `reconnect_after` and
+    /// `primary_cooldown`, with a ten-second deadline and interval.
+    fn timings(reconnect_after: Duration, primary_cooldown: Duration) -> ResyncTimings {
+        ResyncTimings {
+            timeout: Duration::from_secs(10),
+            resnapshot_interval: Duration::from_secs(10),
+            reconnect_after,
+            primary_cooldown,
+        }
+    }
+
+    fn resync_on(timings: ResyncTimings, symbols: &[&str]) -> Resync {
+        let mut resync = Resync::new(timings);
         resync.start(&symbols.iter().map(|&symbol| symbol.into()).collect());
         resync
+    }
+
+    fn resync_of(symbols: &[&str]) -> Resync {
+        resync_on(timings(HOUR, HOUR), symbols)
     }
 
     #[test]
@@ -167,16 +227,36 @@ mod tests {
     }
 
     #[test]
-    fn a_change_before_the_deadline_needs_no_new_socket() {
-        assert!(!resync_of(&["A"]).needs_new_socket());
+    fn a_change_before_the_deadline_waits_for_the_snapshot_asked_for() {
+        let mut resync = resync_on(timings(Duration::ZERO, Duration::ZERO), &["A"]);
+        assert_eq!(resync.remedy("A", HOUR), Remedy::Wait);
     }
 
     #[test]
-    fn only_the_first_change_after_the_deadline_needs_a_new_socket() {
-        let mut resync = resync_of(&["A"]);
+    fn a_change_after_the_deadline_asks_again_once_per_interval() {
+        let mut resync = resync_of(&["A", "B"]);
         resync.expire();
-        let first = resync.needs_new_socket();
-        assert_eq!((first, resync.needs_new_socket()), (true, false));
+        let a = [resync.remedy("A", HOUR), resync.remedy("A", HOUR)];
+        let b = resync.remedy("B", HOUR);
+        let expected = ([Remedy::Resnapshot, Remedy::Wait], Remedy::Resnapshot);
+        assert_eq!((a, b), expected);
+    }
+
+    #[test]
+    fn only_the_first_change_past_the_ceiling_needs_a_new_socket() {
+        let mut resync = resync_on(timings(Duration::ZERO, Duration::ZERO), &["A"]);
+        resync.expire();
+        let first = resync.remedy("A", Duration::ZERO);
+        let second = resync.remedy("A", HOUR);
+        assert_eq!((first, second), (Remedy::NewSocket, Remedy::Wait));
+    }
+
+    #[test]
+    fn a_socket_new_to_the_primary_role_asks_again_instead_of_reconnecting() {
+        let mut resync = resync_on(timings(Duration::ZERO, HOUR), &["A"]);
+        resync.expire();
+        let remedy = resync.remedy("A", Duration::from_secs(59));
+        assert_eq!(remedy, Remedy::Resnapshot);
     }
 
     #[test]
