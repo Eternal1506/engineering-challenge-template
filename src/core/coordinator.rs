@@ -48,6 +48,7 @@ use crate::core::shard::{
     ShardPlan,
 };
 use crate::core::stats::{self, Census, ChangeCause, RecorderCounters, StatsReporter};
+use crate::core::watchdog::{Heartbeat, Heartbeats};
 use crate::core::writer::{WriterMessage, WriterProgress};
 use crate::core::ws::{ConnectionConfig, ConnectionEvent};
 use crate::exchange::{FeedCodec, FeedEndpoint, MarketCatalog, MarketInfo};
@@ -194,6 +195,9 @@ pub struct Coordinator<E, C> {
     progress: Arc<WriterProgress>,
     stall_timeout: Duration,
     budget: ConnectionBudget,
+    /// Beats on every turn of the serving loop, which the one-second sample
+    /// tick keeps turning, and every second spent waiting for the writer.
+    heartbeat: Heartbeat,
 }
 
 /// Startup milestones, each logged once.
@@ -213,6 +217,7 @@ where
         let upkeep = Upkeep::new(feed.lifecycle_endpoint.take(), config.lifecycle.clone());
         let context = shard_context(feed, writer.messages, &config);
         let counters = context.counters.clone();
+        let heartbeat = context.heartbeats.register("coordinator");
         Self {
             context,
             registry: Registry::new(config.shard_size),
@@ -226,6 +231,7 @@ where
             progress: writer.progress,
             stall_timeout: config.stall_timeout,
             budget: ConnectionBudget::new(config.replicas, config.max_connections),
+            heartbeat,
         }
     }
 
@@ -283,6 +289,12 @@ where
         self.context.counters.clone()
     }
 
+    /// The heartbeats of the coordinator, as `coordinator`, and of each
+    /// running shard supervisor, as `shard <id>`, for the watchdog.
+    pub fn heartbeats(&self) -> Heartbeats {
+        self.context.heartbeats.clone()
+    }
+
     /// Closes every shard and the lifecycle connection, and waits for each
     /// shard to hand its last events to the writer. If the writer shows no
     /// sign of moving for the stall timeout meanwhile, abandons the events
@@ -319,6 +331,7 @@ where
         let mut timers = Timers::new(&self.upkeep.timings);
         self.start_lifecycle();
         loop {
+            self.heartbeat.beat();
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Ok(()),
@@ -544,8 +557,12 @@ where
         }
     }
 
+    /// Sends `message` to the writer, beating the heartbeat every second
+    /// it waits for room, so a slow writer does not make the coordinator
+    /// look stalled.
     async fn send_to_writer(&self, message: WriterMessage) {
-        if self.context.writer.send(message).await.is_err() {
+        let sending = self.context.writer.send(message);
+        if self.heartbeat.beat_while(sending).await.is_err() {
             tracing::error!("the writer has stopped");
         }
     }
@@ -569,6 +586,7 @@ fn shard_context<E, C>(
         counters: Arc::new(RecorderCounters::default()),
         cancel: CancellationToken::new(),
         abandon: CancellationToken::new(),
+        heartbeats: Heartbeats::default(),
     }
 }
 

@@ -1,10 +1,19 @@
 //! Command line interface: `record` (the default), `probe` and `verify`.
 
+use std::fs::File;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+
+/// The placeholder in `record --output` for the run's start time.
+const START_PLACEHOLDER: &str = "{start}";
+
+/// How the start time fills [`START_PLACEHOLDER`].
+const START_STAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 
 /// Records the order book of every live Kalshi market as SBE messages.
 ///
@@ -41,7 +50,9 @@ pub enum Command {
 /// Options for `record`.
 #[derive(Debug, PartialEq, Eq, Args)]
 pub struct RecordArgs {
-    /// Where to write SBE output.
+    /// Where to write SBE output. `{start}` in it becomes the UTC start
+    /// time, as in `20261026T143005Z`, so each run gets its own file, which
+    /// must not exist yet. The directory must exist.
     #[arg(long, value_name = "PATH", default_value = "/dev/stdout")]
     pub output: PathBuf,
 
@@ -81,6 +92,34 @@ pub struct RecordArgs {
 
     #[command(flatten)]
     pub secrets: SecretsArgs,
+}
+
+impl RecordArgs {
+    /// The output path for a run started at `start`: every `{start}` in
+    /// `output` replaced with `start` as `YYYYMMDDTHHMMSSZ`, which is safe in
+    /// file names and sorts in time order. A path that is not UTF-8 is used
+    /// as given.
+    pub fn output_for(&self, start: DateTime<Utc>) -> PathBuf {
+        let Some(output) = self.output.to_str() else {
+            return self.output.clone();
+        };
+        let stamp = start.format(START_STAMP_FORMAT).to_string();
+        PathBuf::from(output.replace(START_PLACEHOLDER, &stamp))
+    }
+
+    /// [`RecordArgs::output_for`] `start`. An output naming `{start}` is
+    /// created empty here and must not exist yet, so a run never writes
+    /// over an earlier one's recording when the clock steps back or two
+    /// runs start within a second; either fails instead.
+    pub fn create_output(&self, start: DateTime<Utc>) -> anyhow::Result<PathBuf> {
+        let output = self.output_for(start);
+        let stamped = self.output.to_str();
+        if stamped.is_some_and(|path| path.contains(START_PLACEHOLDER)) {
+            File::create_new(&output)
+                .with_context(|| format!("creating {}, which must be new", output.display()))?;
+        }
+        Ok(output)
+    }
 }
 
 /// Options for `probe`.
@@ -240,6 +279,86 @@ mod tests {
         };
         let parsed = parse(&["record", "--reconcile-interval", "300"]).unwrap();
         assert_eq!(parsed, Command::Record(expected));
+    }
+
+    fn output_at(output: &str, start: &str) -> PathBuf {
+        let args = RecordArgs {
+            output: PathBuf::from(output),
+            ..default_record_args()
+        };
+        args.output_for(start.parse().unwrap())
+    }
+
+    #[test]
+    fn start_in_the_output_becomes_the_utc_start_time() {
+        let output = output_at("/rec/kalshi-{start}.sbe", "2026-10-26T14:30:05.9+02:00");
+        assert_eq!(output, PathBuf::from("/rec/kalshi-20261026T123005Z.sbe"));
+    }
+
+    #[test]
+    fn every_start_in_the_output_is_replaced() {
+        let output = output_at("/rec/{start}/run-{start}.sbe", "2026-01-02T03:04:05Z");
+        let expected = "/rec/20260102T030405Z/run-20260102T030405Z.sbe";
+        assert_eq!(output, PathBuf::from(expected));
+    }
+
+    #[test]
+    fn an_output_without_start_is_unchanged() {
+        let output = output_at("/dev/stdout", "2026-01-02T03:04:05Z");
+        assert_eq!(output, PathBuf::from("/dev/stdout"));
+    }
+
+    #[test]
+    fn start_stamps_sort_in_time_order() {
+        let earlier = output_at("{start}", "2026-09-30T23:59:59Z");
+        let later = output_at("{start}", "2026-10-01T00:00:00Z");
+        assert!(earlier < later, "{earlier:?} {later:?}");
+    }
+
+    /// Record args writing to `output` under `dir`.
+    fn writing_under(dir: &tempfile::TempDir, output: &str) -> RecordArgs {
+        RecordArgs {
+            output: dir.path().join(output),
+            ..default_record_args()
+        }
+    }
+
+    const START: &str = "2026-01-02T03:04:05Z";
+
+    #[test]
+    fn a_stamped_output_is_created_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = writing_under(&dir, "kalshi-{start}.sbe");
+        let output = args.create_output(START.parse().unwrap()).unwrap();
+        let expected = dir.path().join("kalshi-20260102T030405Z.sbe");
+        assert_eq!((output, expected.metadata().unwrap().len()), (expected, 0));
+    }
+
+    #[test]
+    fn a_stamped_output_that_exists_fails_and_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = dir.path().join("kalshi-20260102T030405Z.sbe");
+        std::fs::write(&earlier, b"earlier run").unwrap();
+        let args = writing_under(&dir, "kalshi-{start}.sbe");
+        let created = args.create_output(START.parse().unwrap());
+        let kept = std::fs::read(&earlier).unwrap();
+        assert_eq!((created.is_err(), kept), (true, b"earlier run".to_vec()));
+    }
+
+    #[test]
+    fn an_unstamped_output_that_exists_is_used_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixed.sbe"), b"old").unwrap();
+        let args = writing_under(&dir, "fixed.sbe");
+        let output = args.create_output(START.parse().unwrap()).unwrap();
+        assert_eq!(output, dir.path().join("fixed.sbe"));
+    }
+
+    #[test]
+    fn a_stamped_output_in_a_missing_directory_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = writing_under(&dir, "missing/kalshi-{start}.sbe");
+        assert!(args.create_output(START.parse().unwrap()).is_err());
     }
 
     fn default_probe_args() -> ProbeArgs {

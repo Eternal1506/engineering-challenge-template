@@ -85,6 +85,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::core::stats::RecorderCounters;
+use crate::core::watchdog::Heartbeats;
 use crate::core::writer::WriterMessage;
 use crate::core::ws::ConnectionConfig;
 use crate::core::ws::traffic::BUCKETS;
@@ -257,6 +258,8 @@ pub struct ShardContext<E, C> {
     /// Fired to make every shard stop waiting for the writer, dropping the
     /// events it has not taken.
     pub abandon: CancellationToken,
+    /// Where each shard's supervisor registers its heartbeat while it runs.
+    pub heartbeats: Heartbeats,
 }
 
 /// A running shard: its connection and supervisor tasks.
@@ -281,9 +284,11 @@ impl ShardHandle {
         let factory = ReplicaFactory::new(context, cancel.clone(), span.clone());
         let replicas = ReplicaSet::start(factory, &plan, context.failover.clone());
         context.counters.note_socket_started();
-        let supervisor = Supervisor::new(replicas, plan.symbols, context);
+        let heartbeat = context.heartbeats.register(&format!("shard {}", id.0));
+        let supervisor = Supervisor::new(replicas, heartbeat, context);
         let (commands, command_receiver) = mpsc::unbounded_channel();
-        let task = tokio::spawn(supervisor.run(command_receiver).instrument(span));
+        let running = supervisor.run(plan.symbols, command_receiver);
+        let task = tokio::spawn(running.instrument(span));
         Self {
             commands,
             cancel,

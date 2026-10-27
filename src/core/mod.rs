@@ -7,5 +7,6 @@ pub mod fixed;
 pub mod shard;
 pub mod stats;
 pub mod verify;
+pub mod watchdog;
 pub mod writer;
 pub mod ws;
