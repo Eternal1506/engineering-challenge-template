@@ -3,11 +3,11 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
 use tokio::time::{Instant, Sleep};
-use tokio_tungstenite::tungstenite::{self, Message};
+use yawc::{Frame, OpCode, WebSocketError};
 
 use super::desired::Desired;
 use super::replies::{Answer, Replies};
@@ -95,7 +95,7 @@ impl<'c, C: FeedCodec> Session<'c, C> {
     pub(super) async fn run(mut self) -> Stop {
         match self.serve().await {
             Stop::Shutdown => {
-                socket::close(&mut self.socket, self.parts.config.close_timeout).await;
+                self.socket.close(self.parts.config.close_timeout).await;
                 Stop::Shutdown
             }
             Stop::Lost(reason) => self.report_lost(reason).await,
@@ -125,7 +125,7 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             request = self.parts.channels.requests.recv() => self.on_request(request).await,
             () = sleep_until_some(batch_at) => self.send_batch().await,
             () = sleep_until_some(snapshot_at) => self.send_snapshot_batch().await,
-            message = self.socket.next() => self.on_message(message).await,
+            message = self.socket.next_frame() => self.on_message(message).await,
             () = self.silence.as_mut() => self.on_silence(),
             () = sleep_until_some(name_by) => Err(unnamed()),
         }
@@ -253,54 +253,58 @@ impl<'c, C: FeedCodec> Session<'c, C> {
     async fn send_tagged(&mut self, command: Command, tag: Option<u64>) -> Step {
         let text = self.parts.codec.encode(&command);
         self.replies.expect(&command, tag);
-        self.write(Message::text(text)).await
+        self.write(text).await
     }
 
-    /// Writes `message`, giving up on shutdown, when the owner is gone, or
-    /// after the liveness timeout, so a socket that stopped draining cannot
-    /// stall the session.
-    async fn write(&mut self, message: Message) -> Step {
+    /// Writes `text`; see [`guard_write`].
+    async fn write(&mut self, text: String) -> Step {
         let limit = self.parts.config.liveness_timeout;
-        let write = tokio::time::timeout(limit, self.socket.send(message));
-        tokio::select! {
-            biased;
-            () = self.parts.channels.cancel.cancelled() => Err(Stop::Shutdown),
-            () = self.parts.channels.events.closed() => Err(Stop::Shutdown),
-            written = write => match written {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(Stop::Lost(format!("write error: {error}"))),
-                Err(_) => Err(Stop::Lost(format!("a write took over {limit:?}"))),
-            },
-        }
+        let write = self.socket.send_text(text);
+        guard_write(self.parts.channels, limit, write).await
+    }
+
+    /// Writes out the replies the socket has queued, such as a pong, at
+    /// once rather than when the next read runs dry; see [`guard_write`].
+    async fn send_replies(&mut self) -> Step {
+        let limit = self.parts.config.liveness_timeout;
+        let write = self.socket.send_replies();
+        guard_write(self.parts.channels, limit, write).await
     }
 
     /// Handles one websocket message. The silence clock restarts only once
     /// the owner has taken everything in it, so a slow owner never looks
     /// like a silent socket.
-    async fn on_message(&mut self, message: Option<Result<Message, tungstenite::Error>>) -> Step {
+    async fn on_message(&mut self, message: Result<Frame, WebSocketError>) -> Step {
         let received_at = Utc::now();
-        let step = self.handle_message(message, received_at).await;
+        let step = match message {
+            Ok(frame) => self.on_frame(frame, received_at).await,
+            Err(WebSocketError::ConnectionClosed) => {
+                Err(Stop::Lost("the server ended the stream".to_owned()))
+            }
+            Err(error) => Err(Stop::Lost(format!("read error: {error}"))),
+        };
         self.last_frame = Instant::now();
         step
     }
 
-    async fn handle_message(
-        &mut self,
-        message: Option<Result<Message, tungstenite::Error>>,
-        received_at: DateTime<Utc>,
-    ) -> Step {
-        match message {
-            Some(Ok(Message::Text(text))) => self.on_text(text.as_str(), received_at).await,
-            Some(Ok(Message::Binary(_))) => {
+    async fn on_frame(&mut self, frame: Frame, received_at: DateTime<Utc>) -> Step {
+        match frame.opcode() {
+            OpCode::Text => match std::str::from_utf8(frame.payload()) {
+                Ok(text) => self.on_text(text, received_at).await,
+                Err(error) => Err(Stop::Lost(format!(
+                    "read error: a text frame is not UTF-8 ({error})"
+                ))),
+            },
+            OpCode::Binary => {
                 tracing::warn!("ignored a binary frame");
                 Ok(())
             }
-            Some(Ok(Message::Close(frame))) => Err(Stop::Lost(format!(
-                "the server closed the socket: {frame:?}"
+            OpCode::Close => Err(Stop::Lost(format!(
+                "the server closed the socket: {}",
+                socket::describe_close(&frame)
             ))),
-            Some(Ok(_)) => Ok(()),
-            Some(Err(error)) => Err(Stop::Lost(format!("read error: {error}"))),
-            None => Err(Stop::Lost("the server ended the stream".to_owned())),
+            OpCode::Ping => self.send_replies().await,
+            _ => Ok(()),
         }
     }
 
@@ -392,7 +396,7 @@ impl<'c, C: FeedCodec> Session<'c, C> {
 
     async fn name_subscription(&mut self, sub: SubId) -> Step {
         self.sub = Some(sub);
-        let local_port = socket::local_port(&self.socket);
+        let local_port = self.socket.local_port();
         tracing::info!(sub = sub.0, local_port, "subscribed");
         self.emit(ConnectionEvent::Connected).await?;
         self.sync_changes().await
@@ -461,6 +465,25 @@ impl<'c, C: FeedCodec> Session<'c, C> {
             () = channels.cancel.cancelled() => Err(Stop::Shutdown),
             sent = channels.events.send(event) => sent.map_err(|_| Stop::Shutdown),
         }
+    }
+}
+
+/// Runs `write`, giving up on shutdown, when the owner is gone, or after
+/// `limit`, so a socket that stopped draining cannot stall the session.
+async fn guard_write(
+    channels: &Channels,
+    limit: Duration,
+    write: impl Future<Output = Result<(), WebSocketError>>,
+) -> Step {
+    tokio::select! {
+        biased;
+        () = channels.cancel.cancelled() => Err(Stop::Shutdown),
+        () = channels.events.closed() => Err(Stop::Shutdown),
+        written = tokio::time::timeout(limit, write) => match written {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Stop::Lost(format!("write error: {error}"))),
+            Err(_) => Err(Stop::Lost(format!("a write took over {limit:?}"))),
+        },
     }
 }
 

@@ -210,3 +210,34 @@ are the VM's `IpExt InOctets` (TLS and TCP included), sampled every 5 s; CPU is 
 - **A shard split does not help overflows caused by our own writer backpressure.** When the writer falls behind, every
   shard waits for it and stops reading its sockets, so the exchange's buffers fill on every connection alike, however
   the markets are spread.
+
+## Websocket compression (2026-10-27)
+
+The client offers permessage-deflate (`ConnectionConfig::compression`, on by default) through yawc 0.5.0, over our own
+TCP, TLS (rustls with aws-lc-rs) and HTTP/1.1 upgrade, and logs what the server agrees to on each socket. It accepts
+only a permessage-deflate answer with the parameters a server may send back to our offer, and fails the handshake on
+anything else. Kalshi agrees to `permessage-deflate; client_no_context_takeover`: it keeps its own compression context
+across messages, and we reset ours after each command. A message over `ConnectionConfig::max_message_bytes` (64 MiB),
+on the wire or once inflated, is a read error that ends the socket.
+
+Four 3-minute live runs of the full recorder on the laptop's WSL, back to back between 04:55 and 05:10 UTC, measured as
+in the replica runs above (steady state is after the first 60 s), on yawc 0.4.2. The runs with compression off used the
+same build with the default flipped. A 2-minute R=2 run on yawc 0.5.0 at 05:35 UTC negotiated the same terms on 149 of
+149 sockets and received 1.38 MB/s at about 11,800 events a second, with 74% CPU, no disconnects and a clean `verify`.
+
+| | R=1 on | R=1 off | R=2 on | R=2 off |
+|---|---|---|---|---|
+| Sockets that negotiated deflate | 75 of 75 | 0 of 75 | 149 of 149 | 0 of 149 |
+| Received, steady state | 0.60 MB/s average, 0.67 peak | 3.45 MB/s average, 4.31 peak | 1.08 MB/s average, 1.86 peak | 6.73 MB/s average, 8.86 peak |
+| CPU, share of one core | 54% | 51% | 74% | 89% |
+| Events recorded per second | about 10,200 | about 10,800 | about 8,200 | about 10,200 |
+| Disconnects | 0 | 0 | 0 | 0 |
+| `verify` | clean | clean | clean | clean |
+
+- **Compression cuts received bytes 5.8× at R=1 and 6.2× at R=2**, which matches the earlier Python probe (5.6×).
+- **It costs no measurable CPU:** within 3 points at R=1, and lower at R=2.
+- **The feed was quieter than in the replica runs:** about 10,000 events a second against 25,000, so 3.45 MB/s
+  uncompressed instead of 8.1 MB/s. The R=2 run with compression spanned 05:00 UTC, when the sweep removed 3,036
+  closed markets, and recorded fewer events.
+- **No run lost a socket**, so these 3-minute runs say nothing about the R=2 disconnect rate on a saturated link
+  (about 460 an hour above). That needs a longer run at a busy hour.

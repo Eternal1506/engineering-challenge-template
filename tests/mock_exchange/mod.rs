@@ -11,12 +11,16 @@
 mod catalog;
 #[allow(dead_code, reason = "each test crate uses different frame builders")]
 mod codec;
+#[allow(dead_code, reason = "only the connection tests compress")]
+mod deflate;
 #[allow(dead_code, reason = "each test crate scripts the server differently")]
 mod server;
 
 #[allow(unused_imports, reason = "the connection tests list no markets")]
 pub use catalog::{CatalogPages, CatalogWalks, MockCatalog, market};
 pub use codec::{MockCodec, SentCommand, frames};
+#[allow(unused_imports, reason = "only the connection tests compress")]
+pub use deflate::{DeflateClient, DeflateServer, Terms};
 #[allow(unused_imports, reason = "the connection tests build no coordinator")]
 pub use server::MockEndpoint;
 pub use server::{MockClient, MockServer};

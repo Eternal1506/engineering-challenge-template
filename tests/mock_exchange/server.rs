@@ -42,11 +42,7 @@ impl MockServer {
     /// `attempt-<n>` on its n-th handshake, so tests can tell that each
     /// connection got fresh headers.
     pub fn endpoint(&self) -> MockEndpoint {
-        let address = self.listener.local_addr().unwrap();
-        MockEndpoint {
-            url: format!("ws://{address}"),
-            handshakes: self.handshakes.clone(),
-        }
+        MockEndpoint::at(&self.listener, self.handshakes.clone())
     }
 
     /// How many handshakes the endpoint has started, accepted or not.
@@ -91,6 +87,18 @@ impl MockServer {
 pub struct MockEndpoint {
     url: String,
     handshakes: Arc<AtomicUsize>,
+}
+
+impl MockEndpoint {
+    /// An endpoint for the server on `listener`, counting its handshakes in
+    /// `handshakes`.
+    pub(super) fn at(listener: &TcpListener, handshakes: Arc<AtomicUsize>) -> Self {
+        let address = listener.local_addr().unwrap();
+        Self {
+            url: format!("ws://{address}"),
+            handshakes,
+        }
+    }
 }
 
 impl FeedEndpoint for MockEndpoint {
@@ -170,6 +178,39 @@ impl MockClient {
     /// Sends a ping; fails once the client has gone.
     pub async fn ping(&mut self) -> Result<(), tungstenite::Error> {
         self.socket.send(Message::Ping(Default::default())).await
+    }
+
+    /// Sends a ping and then `backlog`, all in one write, so the client
+    /// finds the backlog already buffered behind the ping.
+    pub async fn ping_ahead_of(&mut self, backlog: Vec<Value>) {
+        self.socket
+            .feed(Message::Ping(Default::default()))
+            .await
+            .unwrap();
+        for frame in backlog {
+            self.socket
+                .feed(Message::text(frame.to_string()))
+                .await
+                .unwrap();
+        }
+        self.socket.flush().await.unwrap();
+    }
+
+    /// Waits for the client's pong.
+    pub async fn expect_pong(&mut self) {
+        timeout(STEP_TIMEOUT, self.until_pong())
+            .await
+            .expect("no pong in time");
+    }
+
+    async fn until_pong(&mut self) {
+        loop {
+            match self.socket.next().await {
+                Some(Ok(Message::Pong(_))) => return,
+                Some(Ok(_)) => continue,
+                other => panic!("the client went away without a pong: {other:?}"),
+            }
+        }
     }
 
     /// Closes the connection from the server's side.

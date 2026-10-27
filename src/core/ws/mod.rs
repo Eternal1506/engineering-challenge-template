@@ -8,7 +8,9 @@
 //!
 //! On each socket:
 //!
-//! - The handshake uses fresh headers from the endpoint, with TCP_NODELAY.
+//! - The handshake uses fresh headers from the endpoint, with TCP_NODELAY,
+//!   and offers permessage-deflate if [`ConnectionConfig::compression`] is
+//!   on. The extensions the server agrees to are logged.
 //! - The subscription goes out as `Subscribe` commands of at most
 //!   [`ConnectionConfig::subscribe_batch_size`] symbols, spaced by
 //!   [`ConnectionConfig::subscribe_batch_interval`]. The exchange names the
@@ -28,7 +30,9 @@
 //!   waiting on the socket;
 //! - no name for the subscription within the liveness timeout of the first
 //!   subscribe, or an error in reply to that subscribe;
-//! - a read or write error, or a write stalled for the liveness timeout;
+//! - a read or write error, a message over
+//!   [`ConnectionConfig::max_message_bytes`] on the wire or once inflated,
+//!   or a write stalled for the liveness timeout;
 //! - a close from the server, or an overflow error;
 //! - a [`Request::Reconnect`].
 //!
@@ -37,12 +41,15 @@
 
 mod backoff;
 mod desired;
+mod extensions;
+mod handshake;
 mod replies;
 mod sequence;
 mod session;
 mod snapshots;
 mod socket;
 pub(crate) mod traffic;
+mod transport;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -167,6 +174,13 @@ pub struct ConnectionConfig {
     pub reply_timeout: Duration,
     /// How long a clean close on shutdown may take.
     pub close_timeout: Duration,
+    /// Whether to offer permessage-deflate. The server decides whether it is
+    /// used; it cuts the bytes on the wire several times over for order
+    /// book traffic.
+    pub compression: bool,
+    /// The largest message accepted, on the wire and once inflated. A
+    /// larger one is a read error that ends the socket.
+    pub max_message_bytes: usize,
 }
 
 impl Default for ConnectionConfig {
@@ -182,6 +196,8 @@ impl Default for ConnectionConfig {
             snapshot_batch_interval: Duration::from_millis(100),
             reply_timeout: Duration::from_secs(30),
             close_timeout: Duration::from_secs(2),
+            compression: true,
+            max_message_bytes: 64 << 20,
         }
     }
 }
@@ -280,8 +296,8 @@ impl<E: FeedEndpoint, C: FeedCodec> Connection<E, C> {
     }
 
     async fn open(&self, channels: &Channels) -> Result<Socket, Stop> {
-        let handshake =
-            tokio::time::timeout(self.config.liveness_timeout, socket::open(&self.endpoint));
+        let opening = socket::open(&self.endpoint, &self.config);
+        let handshake = tokio::time::timeout(self.config.liveness_timeout, opening);
         let failure = tokio::select! {
             () = channels.cancel.cancelled() => return Err(Stop::Shutdown),
             () = channels.events.closed() => return Err(Stop::Shutdown),

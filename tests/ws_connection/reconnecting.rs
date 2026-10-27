@@ -232,6 +232,20 @@ async fn pings_keep_a_quiet_connection_alive() {
     running.assert_no_event(Duration::ZERO).await;
 }
 
+/// A ping with a backlog behind it is answered at once, not once the backlog
+/// is read: the owner here takes nothing, so the backlog stays unread.
+#[tokio::test]
+async fn a_ping_is_answered_before_the_backlog_behind_it() {
+    let server = MockServer::start().await;
+    let mut running = Setup::new(books(&["A"])).event_capacity(1).start(&server);
+    let mut client = server.accept().await;
+    subscribe(&mut client, &mut running, 1).await;
+    let backlog = (1..=200).map(|seq| frames::delta(1, seq, "A")).collect();
+    client.ping_ahead_of(backlog).await;
+    client.expect_pong().await;
+    assert_eq!(seq(&running.next_frame().await), 1);
+}
+
 /// The owner stops reading for longer than the liveness timeout while the
 /// connection holds a frame for it. Once the owner catches up, the socket is
 /// not mistaken for a silent one.

@@ -5,6 +5,8 @@
 #[path = "mock_exchange/mod.rs"]
 mod mock_exchange;
 
+#[path = "ws_connection/compression.rs"]
+mod compression;
 #[path = "ws_connection/messages.rs"]
 mod messages;
 #[path = "ws_connection/reconnecting.rs"]
@@ -23,7 +25,7 @@ use engineering_challenge::core::events::{Decoded, Inbound, SubId};
 use engineering_challenge::core::ws::{
     Connection, ConnectionConfig, ConnectionEvent, Request, Subscription,
 };
-use mock_exchange::{MockClient, MockCodec, MockServer, SentCommand, frames};
+use mock_exchange::{MockClient, MockCodec, MockEndpoint, MockServer, SentCommand, frames};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
@@ -109,12 +111,17 @@ impl Setup {
 
     /// Spawns the connection against `server`.
     fn start(self, server: &MockServer) -> Running {
+        self.start_at(server.endpoint())
+    }
+
+    /// Spawns the connection against `endpoint`.
+    fn start_at(self, endpoint: MockEndpoint) -> Running {
         let codec = MockCodec::default();
         let (requests, request_receiver) = mpsc::unbounded_channel();
         let (event_sender, events) = mpsc::channel(self.event_capacity);
         let cancel = CancellationToken::new();
-        let connection = Connection::new(server.endpoint(), codec.clone(), self.subscription)
-            .with_config(self.config);
+        let connection =
+            Connection::new(endpoint, codec.clone(), self.subscription).with_config(self.config);
         let task = tokio::spawn(connection.run(request_receiver, event_sender, cancel.clone()));
         Running {
             codec,
